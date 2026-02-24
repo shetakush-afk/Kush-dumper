@@ -21,10 +21,13 @@ from telegram.ext import (
 TELEGRAM_TOKEN = "7545064228:AAHYqBGcXGJpK1WUp68-uuLZjMjTiPEPb2o"
 OXY_USER = "Pika1_MhRPr"
 OXY_PASS = "Pika=1234pika"
+GROQ_API_KEY = "gsk_PASTE_YOUR_GROQ_KEY_HERE"
 OWNER_IDS = {7214730073, 8003049490}
 DB_FILE = "users_db.json"
 PARSER_THREADS = 5
 GLOBAL_MAX_CONCURRENT = 10
+AI_BATCH_SIZE = 200
+AI_MAX_CALLS = 5
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -254,6 +257,104 @@ async def fetch_suggest_throttled(session, query, sem):
         async with global_queue.slot():
             return await fetch_google_suggest(session, query)
 
+# ──────────────────────────────────────────────
+#  AI KEYWORD EXPANSION (Groq — free Llama API)
+# ──────────────────────────────────────────────
+
+AI_PROMPTS = [
+    (
+        "You are a keyword research expert. Given the brand/site '{brand}', generate {count} unique, "
+        "diverse search keywords that people would use on Google related to this brand. "
+        "Include variations like: login pages, account access, data leaks, config files, "
+        "admin panels, subdomains, API endpoints, error pages, backup files, user databases, "
+        "password resets, alternative sites, tools, scripts, tutorials, and exploits. "
+        "Output ONLY the keywords, one per line. No numbering, no explanations."
+    ),
+    (
+        "Generate {count} Google search keywords for '{brand}'. Focus on: "
+        "exposed files (sql, env, log, bak, cfg), cloud storage leaks (s3, azure, gcs), "
+        "open directories, git repos, credential dumps, payment pages, checkout systems, "
+        "API keys, tokens, secrets, internal tools, staging servers, debug pages, phpinfo, "
+        "wp-admin, cPanel, webmail, database errors, and stack traces. "
+        "Output ONLY keywords, one per line."
+    ),
+    (
+        "You are an OSINT specialist. Generate {count} unique search queries for '{brand}' "
+        "covering: employee info, org structure, tech stack, CDN, mail servers, DNS records, "
+        "SSL certificates, WHOIS data, social media profiles, job postings with tech details, "
+        "conference talks, GitHub repos, npm packages, Docker images, Kubernetes configs, "
+        "CI/CD pipelines, monitoring dashboards, status pages, and changelogs. "
+        "Output ONLY queries, one per line."
+    ),
+    (
+        "Generate {count} long-tail search keywords for '{brand}' that include: "
+        "year-specific queries (2024, 2025, 2026), region-specific variations, "
+        "competitor comparisons, 'how to' guides, troubleshooting queries, "
+        "review and rating searches, pricing queries, feature requests, "
+        "integration keywords, migration keywords, and security audit terms. "
+        "Output ONLY keywords, one per line."
+    ),
+    (
+        "Create {count} niche search dork keywords for '{brand}'. Include: "
+        "filetype-specific (pdf, xlsx, doc, csv, xml, json), inurl patterns, "
+        "intitle patterns, cache/archive queries, site-specific (pastebin, github, "
+        "trello, jira, confluence, slack, discord), and deep web references. "
+        "Output ONLY raw keywords, one per line."
+    ),
+]
+
+async def ai_expand_keywords(session, brand, existing_kw, target_count):
+    if GROQ_API_KEY.startswith("gsk_PASTE"):
+        logger.warning("AI: Groq API key not configured, skipping AI expansion")
+        return set()
+
+    new_kw = set()
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    api_url = "https://api.groq.com/openai/v1/chat/completions"
+
+    needed = max(target_count - len(existing_kw), 200)
+    per_call = max(needed // AI_MAX_CALLS, AI_BATCH_SIZE)
+
+    for i in range(min(AI_MAX_CALLS, len(AI_PROMPTS))):
+        if len(existing_kw) + len(new_kw) >= target_count:
+            break
+
+        prompt = AI_PROMPTS[i].format(brand=brand, count=per_call)
+        sample = random.sample(list(existing_kw), min(20, len(existing_kw)))
+        prompt += f"\n\nHere are some existing keywords to avoid duplicating and to use as inspiration:\n" + "\n".join(sample)
+
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.9,
+            "max_tokens": 4000,
+        }
+        try:
+            async with session.post(
+                api_url, headers=headers, json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status != 200:
+                    err = await r.text()
+                    logger.error("AI call %d HTTP %d: %.200s", i, r.status, err)
+                    continue
+                data = await r.json()
+                text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                lines = [l.strip().lower().lstrip("0123456789.-) ") for l in text.splitlines()]
+                for line in lines:
+                    cleaned = line.strip()
+                    if cleaned and len(cleaned) > 2 and len(cleaned) < 200:
+                        new_kw.add(cleaned)
+                logger.info("AI call %d: got %d new keywords for '%s'", i, len(lines), brand)
+        except Exception as e:
+            logger.error("AI call %d error: %s", i, e)
+            continue
+
+    return new_kw
+
 async def generate_keywords(session, brand, max_count, status_msg, sem):
     all_kw = set()
     all_kw.add(brand)
@@ -299,16 +400,33 @@ async def generate_keywords(session, brand, max_count, status_msg, sem):
 
         logger.info("KW: after scraping got %d keywords for '%s'", len(all_kw), brand)
 
+    # ── Layer 3: AI Expansion ──
+    if len(all_kw) < max_count and not GROQ_API_KEY.startswith("gsk_PASTE"):
         try:
             await status_msg.edit_text(
-                f"🔤 *Keyword Maker — Processing*\n{DIV}\n\n"
+                f"🔤 *Keyword Maker — AI Expanding*\n{DIV}\n\n"
                 f"   Brand: `{esc(brand)}`\n"
-                f"   Scraped keywords: `{len(all_kw)}`\n"
-                f"   Expanding to `{max_count}`\\.\\.\\.\n\n"
+                f"   Current keywords: `{len(all_kw)}`\n"
+                f"   🤖 AI generating more\\.\\.\\.\n\n"
                 f"{pbar(len(all_kw), max_count)}",
                 parse_mode=ParseMode.MARKDOWN_V2)
         except Exception:
             pass
+
+        ai_kw = await ai_expand_keywords(session, brand, all_kw, max_count)
+        all_kw.update(ai_kw)
+        logger.info("KW: after AI expansion got %d keywords for '%s'", len(all_kw), brand)
+
+    try:
+        await status_msg.edit_text(
+            f"🔤 *Keyword Maker — Finalizing*\n{DIV}\n\n"
+            f"   Brand: `{esc(brand)}`\n"
+            f"   Total keywords: `{len(all_kw)}`\n"
+            f"   Expanding to `{max_count}`\\.\\.\\.\n\n"
+            f"{pbar(len(all_kw), max_count)}",
+            parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception:
+        pass
 
     if len(all_kw) < max_count:
         extra_suffixes = [
@@ -721,7 +839,7 @@ WELCOME = (
     f"{DIV}\n\n"
     "Welcome\\! Pick a module to get started\\.\n\n"
     "📌 *Full Pipeline:*\n"
-    "  1️⃣  🔤 Keyword Maker \\→ generate keywords\n"
+    "  1️⃣  🔤 Keyword Maker \\→ AI\\-powered keywords\n"
     "  2️⃣  🛠 Dork Generator \\→ build dorks\n"
     "  3️⃣  🔎 Deep Parser \\→ get real URLs\n\n"
     f"{DIV}"
@@ -732,8 +850,9 @@ HELP = (
     f"{DIV}\n\n"
     "🔤 *Keyword Maker*  \\(FREE\\)\n"
     "  Give a site \\(e\\.g\\. `netflix.com`\\)\n"
-    "  Bot scrapes Google \\+ expands to UHQ keywords\\.\n"
-    "  Set any custom count \\(50\\-5000\\)\\.\n\n"
+    "  🤖 *AI\\-Powered* \\+ Google scraping \\+ algorithmic\\.\n"
+    "  Generates massive UHQ keyword lists\\.\n"
+    "  Set any custom count \\(50\\-50000\\)\\.\n\n"
     "🛠 *Dork Generator*  \\(FREE\\)\n"
     "  3 presets \\(Combo, Shopping, CC SQLi\\)\n"
     "  \\+ Custom Builder with full control\\.\n"
@@ -885,6 +1004,25 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"User `{tid}` not found\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
+async def cmd_setgroq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global GROQ_API_KEY
+    if update.effective_user.id not in OWNER_IDS: return
+    if not context.args:
+        masked = GROQ_API_KEY[:8] + "\\*\\*\\*" if not GROQ_API_KEY.startswith("gsk_PASTE") else "Not set"
+        await update.message.reply_text(
+            f"🤖 *Groq AI Config*\n{DIV}\n\n"
+            f"   Current key: `{masked}`\n\n"
+            f"Usage: `/setgroq YOUR_GROQ_API_KEY`\n\n"
+            f"Get a free key at: `console.groq.com`",
+            parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    GROQ_API_KEY = context.args[0].strip()
+    await update.message.reply_text(
+        f"✅ *Groq API key updated\\!*\n\n"
+        f"   Key: `{esc(GROQ_API_KEY[:8])}\\*\\*\\*`\n\n"
+        f"AI keyword expansion is now *active*\\.",
+        parse_mode=ParseMode.MARKDOWN_V2)
+
 # ──────────────────────────────────────────────
 #  BUTTON HANDLER
 # ──────────────────────────────────────────────
@@ -936,7 +1074,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"🔤 *Keyword Maker*\n{DIV}\n\n"
             f"Generates UHQ keywords from any site name\\.\n"
-            f"Scrapes Google \\+ algorithmic expansion\\.\n\n"
+            f"🤖 *AI\\-Powered* \\+ Google scraping \\+ algorithmic\\.\n\n"
             f"📊 *How many keywords* to generate?\n\n"
             f"Pick a preset or type a custom number\\.\n\n"
             f"🆓 This is *free* — no license needed\\!"
@@ -1481,6 +1619,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("key", cmd_key))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
+    app.add_handler(CommandHandler("setgroq", cmd_setgroq))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
