@@ -266,38 +266,43 @@ AI_PROMPTS = [
     (
         "You are a keyword research expert. Given the brand/site '{brand}', generate {count} unique, "
         "diverse search keywords that people would use on Google related to this brand. "
+        "CRITICAL: Every single keyword MUST contain the word '{brand}'. "
         "Include variations like: login pages, account access, data leaks, config files, "
         "admin panels, subdomains, API endpoints, error pages, backup files, user databases, "
         "password resets, alternative sites, tools, scripts, tutorials, and exploits. "
         "Output ONLY the keywords, one per line. No numbering, no explanations, no extra text."
     ),
     (
-        "Generate {count} Google search keywords for '{brand}'. Focus on: "
-        "exposed files (sql, env, log, bak, cfg), cloud storage leaks (s3, azure, gcs), "
+        "Generate {count} Google search keywords for '{brand}'. "
+        "CRITICAL: Every keyword MUST contain the word '{brand}'. "
+        "Focus on: exposed files (sql, env, log, bak, cfg), cloud storage leaks (s3, azure, gcs), "
         "open directories, git repos, credential dumps, payment pages, checkout systems, "
         "API keys, tokens, secrets, internal tools, staging servers, debug pages, phpinfo, "
         "wp-admin, cPanel, webmail, database errors, and stack traces. "
         "Output ONLY keywords, one per line. No numbering, no extra text."
     ),
     (
-        "You are an OSINT specialist. Generate {count} unique search queries for '{brand}' "
-        "covering: employee info, org structure, tech stack, CDN, mail servers, DNS records, "
+        "You are an OSINT specialist. Generate {count} unique search queries for '{brand}'. "
+        "CRITICAL: Every query MUST contain the word '{brand}'. "
+        "Cover: employee info, org structure, tech stack, CDN, mail servers, DNS records, "
         "SSL certificates, WHOIS data, social media profiles, job postings with tech details, "
         "conference talks, GitHub repos, npm packages, Docker images, Kubernetes configs, "
         "CI/CD pipelines, monitoring dashboards, status pages, and changelogs. "
         "Output ONLY queries, one per line. No numbering, no extra text."
     ),
     (
-        "Generate {count} long-tail search keywords for '{brand}' that include: "
-        "year-specific queries (2024, 2025, 2026), region-specific variations, "
+        "Generate {count} long-tail search keywords for '{brand}'. "
+        "CRITICAL: Every keyword MUST contain the word '{brand}'. "
+        "Include: year-specific queries (2024, 2025, 2026), region-specific variations, "
         "competitor comparisons, 'how to' guides, troubleshooting queries, "
         "review and rating searches, pricing queries, feature requests, "
         "integration keywords, migration keywords, and security audit terms. "
         "Output ONLY keywords, one per line. No numbering, no extra text."
     ),
     (
-        "Create {count} niche search dork keywords for '{brand}'. Include: "
-        "filetype-specific (pdf, xlsx, doc, csv, xml, json), inurl patterns, "
+        "Create {count} niche search dork keywords for '{brand}'. "
+        "CRITICAL: Every keyword MUST contain the word '{brand}'. "
+        "Include: filetype-specific (pdf, xlsx, doc, csv, xml, json), inurl patterns, "
         "intitle patterns, cache/archive queries, site-specific (pastebin, github, "
         "trello, jira, confluence, slack, discord), and deep web references. "
         "Output ONLY raw keywords, one per line. No numbering, no extra text."
@@ -318,6 +323,7 @@ async def ai_expand_keywords(brand, existing_kw, target_count):
         return set()
 
     new_kw = set()
+    brand_lower = brand.lower()
     needed = max(target_count - len(existing_kw), 200)
     per_call = max(needed // AI_MAX_CALLS, AI_BATCH_SIZE)
 
@@ -336,12 +342,17 @@ async def ai_expand_keywords(brand, existing_kw, target_count):
             )
             text = response.choices[0].message.content or ""
             count_before = len(new_kw)
+            rejected = 0
             for line in text.splitlines():
                 cleaned = _clean_ai_line(line)
-                if cleaned and len(cleaned) > 2 and len(cleaned) < 200 and not cleaned.startswith("http"):
-                    new_kw.add(cleaned)
+                if not cleaned or len(cleaned) <= 2 or len(cleaned) >= 200 or cleaned.startswith("http"):
+                    continue
+                if brand_lower not in cleaned:
+                    rejected += 1
+                    continue
+                new_kw.add(cleaned)
             added = len(new_kw) - count_before
-            logger.info("AI call %d: +%d keywords for '%s' (total AI: %d)", i, added, brand, len(new_kw))
+            logger.info("AI call %d: +%d keywords, %d rejected (no brand) for '%s'", i, added, rejected, brand)
         except Exception as e:
             logger.error("AI call %d error: %s", i, e)
             continue
@@ -384,14 +395,20 @@ async def generate_keywords(session, brand, max_count, status_msg, sem):
         tasks = [fetch_suggest_throttled(session, q, sem) for q in seed_queries]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        brand_lower = brand.lower()
+        scraped_rejected = 0
         for r in results:
             if isinstance(r, list):
                 for kw in r:
                     kw_clean = kw.strip().lower()
-                    if kw_clean and len(kw_clean) > 2:
-                        all_kw.add(kw_clean)
+                    if not kw_clean or len(kw_clean) <= 2:
+                        continue
+                    if brand_lower not in kw_clean:
+                        scraped_rejected += 1
+                        continue
+                    all_kw.add(kw_clean)
 
-        logger.info("KW: after scraping got %d keywords for '%s'", len(all_kw), brand)
+        logger.info("KW: after scraping got %d keywords (%d rejected, no brand) for '%s'", len(all_kw), scraped_rejected, brand)
 
     # ── Layer 3: AI Expansion ──
     if len(all_kw) < max_count and AI_ENABLED:
