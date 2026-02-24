@@ -950,13 +950,14 @@ def is_banned(uid):
     return db.get(str(uid), {}).get("banned", False)
 
 # ──────────────────────────────────────────────
-#  ANTI-PUBLIC CHECKER
+#  ANTI-PUBLIC CHECKER (AI pre-filter + Google verify)
 # ──────────────────────────────────────────────
 
 ANTI_PUBLIC_THRESHOLDS = {
     "anti_public": 50000,
     "semi_public": 500000,
 }
+ANTIPUB_CONCURRENCY = 20
 
 async def fetch_result_count(session, keyword, sem):
     async with sem:
@@ -974,7 +975,7 @@ async def fetch_result_count(session, keyword, sem):
             try:
                 async with session.post(
                     url, auth=aiohttp.BasicAuth(OXY_USER, OXY_PASS),
-                    json=payload, timeout=aiohttp.ClientTimeout(total=30),
+                    json=payload, timeout=aiohttp.ClientTimeout(total=20),
                 ) as r:
                     if r.status != 200:
                         return keyword, -1
@@ -1001,6 +1002,69 @@ def classify_keyword(result_count):
     if result_count <= ANTI_PUBLIC_THRESHOLDS["semi_public"]:
         return "semi_public"
     return "public"
+
+AI_ANTIPUB_PROMPT = (
+    "You are a keyword rarity analyst. I'll give you a batch of keywords. "
+    "For each keyword, respond with ONLY the keyword followed by a pipe and a score: "
+    "R = rare/niche (likely few Google results), M = moderate, P = public/common (millions of results). "
+    "Format: keyword|R or keyword|M or keyword|P. One per line. No extra text.\n\n"
+    "Keywords:\n{keywords}"
+)
+
+async def ai_prefilter_antipub(keywords, status_msg):
+    likely_rare = []
+    likely_moderate = []
+    likely_public = []
+
+    batch_size = 100
+    batches = [keywords[i:i+batch_size] for i in range(0, len(keywords), batch_size)]
+    max_batches = min(len(batches), 20)
+
+    for batch_idx in range(max_batches):
+        batch = batches[batch_idx]
+        prompt = AI_ANTIPUB_PROMPT.format(keywords="\n".join(batch))
+        try:
+            response = await g4f_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.choices[0].message.content or ""
+            for line in text.splitlines():
+                line = line.strip()
+                if "|" not in line:
+                    continue
+                parts = line.rsplit("|", 1)
+                kw = parts[0].strip().lower()
+                score = parts[1].strip().upper() if len(parts) > 1 else ""
+                if not kw:
+                    continue
+                if score.startswith("R"):
+                    likely_rare.append(kw)
+                elif score.startswith("M"):
+                    likely_moderate.append(kw)
+                else:
+                    likely_public.append(kw)
+            logger.info("AI prefilter batch %d: R=%d M=%d P=%d",
+                        batch_idx, len(likely_rare), len(likely_moderate), len(likely_public))
+        except Exception as e:
+            logger.error("AI prefilter batch %d error: %s", batch_idx, e)
+            likely_rare.extend(batch)
+
+        if (batch_idx + 1) % 3 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"🔍 *Anti\\-Public — AI Pre\\-Filter*\n{DIV}\n\n"
+                    f"   Analyzed: `{min((batch_idx+1)*batch_size, len(keywords))}/{len(keywords)}`\n"
+                    f"   🟢 Likely rare: `{len(likely_rare)}`\n"
+                    f"   🟡 Likely moderate: `{len(likely_moderate)}`\n"
+                    f"   🔴 Likely public: `{len(likely_public)}`\n\n"
+                    f"{pbar(batch_idx+1, max_batches)}\n\n"
+                    f"⏳ AI scanning fast\\.\\.\\.",
+                    parse_mode=ParseMode.MARKDOWN_V2)
+            except Exception:
+                pass
+
+    return likely_rare, likely_moderate, likely_public
 
 # ──────────────────────────────────────────────
 #  STATIC TEXTS
@@ -1846,7 +1910,7 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             caption=f"🧲 {len(kw_list)} keywords ({len(input_keywords)} input → {len(new_kw)} new)")
         return
 
-    # ── ANTI-PUBLIC CHECKER ──
+    # ── ANTI-PUBLIC CHECKER (AI pre-filter + Google verify) ──
     if mode == "KEYWORD" and step == "antipub_input":
         input_keywords = [l.strip() for l in lines if l.strip() and len(l.strip()) > 2]
         input_keywords = list(dict.fromkeys(input_keywords))
@@ -1857,61 +1921,84 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
                 parse_mode=ParseMode.MARKDOWN_V2)
             return
 
-        if len(input_keywords) > 5000:
+        if len(input_keywords) > 10000:
             await update.message.reply_text(
-                "⚠️ *Too many keywords\\!* Maximum is 5000 at once\\.",
+                "⚠️ *Too many keywords\\!* Maximum is 10000 at once\\.",
                 parse_mode=ParseMode.MARKDOWN_V2)
             return
 
         status = await update.message.reply_text(
             f"🔍 *Anti\\-Public Checker — Starting*\n{DIV}\n\n"
-            f"   Keywords to check: `{len(input_keywords)}`\n\n"
-            f"{pbar(0, len(input_keywords))}\n\n"
-            f"⏳ Checking against Google\\.\\.\\.",
+            f"   Keywords: `{len(input_keywords)}`\n\n"
+            f"⏳ Phase 1: 🤖 AI pre\\-filtering \\(fast\\)\\.\\.\\.",
             parse_mode=ParseMode.MARKDOWN_V2)
 
-        sem = get_semaphore(uid)
+        # ── Phase 1: AI pre-filter (fast, free) ──
+        ai_rare, ai_moderate, ai_public = await ai_prefilter_antipub(input_keywords, status)
+        ai_unmatched = set(k.lower() for k in input_keywords) - set(ai_rare) - set(ai_moderate) - set(ai_public)
+        ai_rare.extend(list(ai_unmatched))
+
+        to_google_check = ai_rare + ai_moderate
+        logger.info("ANTIPUB: AI pre-filter done. rare=%d moderate=%d public=%d → google checking %d",
+                     len(ai_rare), len(ai_moderate), len(ai_public), len(to_google_check))
+
+        try:
+            await status.edit_text(
+                f"🔍 *Anti\\-Public — Phase 1 Done*\n{DIV}\n\n"
+                f"   🤖 AI scanned: `{len(input_keywords)}`\n"
+                f"   🔴 AI filtered as public: `{len(ai_public)}`\n"
+                f"   ➡️ Sending to Google: `{len(to_google_check)}`\n\n"
+                f"⏳ Phase 2: Google verifying\\.\\.\\.",
+                parse_mode=ParseMode.MARKDOWN_V2)
+        except Exception:
+            pass
+
+        # ── Phase 2: Google verify (only promising keywords) ──
+        antipub_sem = asyncio.Semaphore(ANTIPUB_CONCURRENCY)
         anti_public = []
         semi_public = []
-        public = []
+        google_public = []
         errors = 0
         done_count = 0
         lock = asyncio.Lock()
+        total_to_check = len(to_google_check)
 
-        async def _check_kw(kw):
-            nonlocal done_count, errors
-            async with aiohttp.ClientSession() as sess:
-                keyword, count = await fetch_result_count(sess, kw, sem)
-            cat = classify_keyword(count)
-            async with lock:
-                if cat == "anti_public":
-                    anti_public.append((keyword, count))
-                elif cat == "semi_public":
-                    semi_public.append((keyword, count))
-                elif cat == "public":
-                    public.append((keyword, count))
-                else:
-                    errors += 1
-                done_count += 1
-                d = done_count
-            if d % 10 == 0 or d == len(input_keywords):
-                try:
-                    await status.edit_text(
-                        f"🔍 *Anti\\-Public Checker — Running*\n{DIV}\n\n"
-                        f"   Checked: `{d}/{len(input_keywords)}`\n"
-                        f"   🟢 Anti\\-Public: `{len(anti_public)}`\n"
-                        f"   🟡 Semi\\-Public: `{len(semi_public)}`\n"
-                        f"   🔴 Public: `{len(public)}`\n\n"
-                        f"{pbar(d, len(input_keywords))}\n\n"
-                        f"⏳ Please wait\\.\\.\\.",
-                        parse_mode=ParseMode.MARKDOWN_V2)
-                except Exception:
-                    pass
+        async with aiohttp.ClientSession() as session:
+            async def _check_kw(kw):
+                nonlocal done_count, errors
+                keyword, count = await fetch_result_count(session, kw, antipub_sem)
+                cat = classify_keyword(count)
+                async with lock:
+                    if cat == "anti_public":
+                        anti_public.append((keyword, count))
+                    elif cat == "semi_public":
+                        semi_public.append((keyword, count))
+                    elif cat == "public":
+                        google_public.append((keyword, count))
+                    else:
+                        errors += 1
+                    done_count += 1
+                    d = done_count
+                if d % 20 == 0 or d == total_to_check:
+                    try:
+                        await status.edit_text(
+                            f"🔍 *Anti\\-Public — Google Verifying*\n{DIV}\n\n"
+                            f"   Checked: `{d}/{total_to_check}`\n"
+                            f"   🟢 Anti\\-Public: `{len(anti_public)}`\n"
+                            f"   🟡 Semi\\-Public: `{len(semi_public)}`\n"
+                            f"   🔴 Public: `{len(google_public) + len(ai_public)}`\n\n"
+                            f"{pbar(d, total_to_check)}\n\n"
+                            f"⚡ {ANTIPUB_CONCURRENCY} concurrent checks\\.\\.\\.",
+                            parse_mode=ParseMode.MARKDOWN_V2)
+                    except Exception:
+                        pass
 
-        batch_size = 10
-        for i in range(0, len(input_keywords), batch_size):
-            batch = input_keywords[i:i+batch_size]
-            await asyncio.gather(*[_check_kw(kw) for kw in batch], return_exceptions=True)
+            batch_size = ANTIPUB_CONCURRENCY
+            for i in range(0, total_to_check, batch_size):
+                batch = to_google_check[i:i+batch_size]
+                await asyncio.gather(*[_check_kw(kw) for kw in batch], return_exceptions=True)
+
+        all_public = [(kw, -1) for kw in ai_public] + google_public
 
         ud = get_user(uid_s)
         ud["uses"] = ud.get("uses", 0) + 1
@@ -1920,22 +2007,23 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
         total = len(input_keywords)
         ap_pct = int(100 * len(anti_public) / total) if total else 0
         sp_pct = int(100 * len(semi_public) / total) if total else 0
-        pb_pct = int(100 * len(public) / total) if total else 0
+        pb_pct = int(100 * len(all_public) / total) if total else 0
         err_note = f"\n   ⚠️ Errors: `{errors}`" if errors else ""
+        skipped_note = f"\n   ⚡ AI\\-skipped: `{len(ai_public)}` \\(saved time\\)" if ai_public else ""
 
         summary = (
             f"✅ *Anti\\-Public Check — Done\\!*\n{DIV}\n\n"
-            f"   Total checked: `{total}`\n\n"
+            f"   Total keywords: `{total}`\n"
+            f"   Google checked: `{total_to_check}`{skipped_note}{err_note}\n\n"
             f"   🟢 Anti\\-Public \\(rare\\): `{len(anti_public)}` \\({ap_pct}%\\)\n"
             f"   🟡 Semi\\-Public: `{len(semi_public)}` \\({sp_pct}%\\)\n"
-            f"   🔴 Public \\(overused\\): `{len(public)}` \\({pb_pct}%\\){err_note}\n\n"
+            f"   🔴 Public \\(overused\\): `{len(all_public)}` \\({pb_pct}%\\)\n\n"
             f"{pbar(1, 1)}\n\n📄 Files below ⬇️"
         )
         await status.edit_text(summary, parse_mode=ParseMode.MARKDOWN_V2)
 
         anti_public.sort(key=lambda x: x[1])
         semi_public.sort(key=lambda x: x[1])
-        public.sort(key=lambda x: x[1])
 
         if anti_public:
             content = "\n".join([kw for kw, _ in anti_public])
@@ -1953,15 +2041,15 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
                 document=f_sp,
                 caption=f"🟡 {len(semi_public)} Semi-Public keywords")
 
-        if public:
-            content = "\n".join([kw for kw, _ in public])
+        if all_public:
+            content = "\n".join([kw for kw, _ in all_public])
             f_pb = io.BytesIO(content.encode())
-            f_pb.name = f"public_{len(public)}.txt"
+            f_pb.name = f"public_{len(all_public)}.txt"
             await update.message.reply_document(
                 document=f_pb,
-                caption=f"🔴 {len(public)} Public (overused) keywords")
+                caption=f"🔴 {len(all_public)} Public (overused) keywords")
 
-        if not anti_public and not semi_public and not public:
+        if not anti_public and not semi_public and not all_public:
             await update.message.reply_text(
                 "⚠️ Could not check any keywords\\. Try again later\\.",
                 parse_mode=ParseMode.MARKDOWN_V2)
