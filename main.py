@@ -359,6 +359,115 @@ async def ai_expand_keywords(brand, existing_kw, target_count):
 
     return new_kw
 
+SCRAPE_PROMPTS = [
+    (
+        "You are a keyword research expert. I have a list of existing keywords. "
+        "Analyze their patterns, themes, and structure, then generate {count} NEW unique keywords "
+        "that follow the same style and topics but are DIFFERENT from the input. "
+        "Create variations by: changing suffixes, adding years, adding action words, "
+        "combining themes, adding specificity (regions, versions, platforms), "
+        "and exploring related sub-topics. "
+        "Output ONLY new keywords, one per line. No numbering, no explanations.\n\n"
+        "Existing keywords:\n{keywords}"
+    ),
+    (
+        "Study these keywords and generate {count} MORE unique keywords in the same niche. "
+        "Focus on: long-tail variations, question-based queries, comparison queries, "
+        "how-to queries, error/troubleshooting queries, year-specific (2024-2026), "
+        "platform-specific (mobile, desktop, web), and action-oriented variations. "
+        "Every keyword should be related to the same topics/brands as the input. "
+        "Output ONLY keywords, one per line. No numbering.\n\n"
+        "Input keywords:\n{keywords}"
+    ),
+    (
+        "Analyze these keywords and generate {count} new related search queries. "
+        "Expand into: security/vulnerability angles, admin/config angles, "
+        "file-type specific queries, site-specific queries (github, pastebin, etc), "
+        "data leak angles, cloud storage angles, API/endpoint angles, "
+        "and technical deep-dive queries. Keep the same brand/topic focus. "
+        "Output ONLY queries, one per line. No numbering.\n\n"
+        "Source keywords:\n{keywords}"
+    ),
+]
+
+async def ai_scrape_expand(input_keywords, status_msg):
+    if not AI_ENABLED:
+        return set()
+
+    new_kw = set()
+    input_set = set(k.lower().strip() for k in input_keywords)
+    total_input = len(input_set)
+
+    brands = _extract_common_words(list(input_set))
+    logger.info("SCRAPE: detected common words: %s", brands[:10])
+
+    batch_size = 80
+    kw_list = list(input_set)
+    random.shuffle(kw_list)
+
+    batches = [kw_list[i:i+batch_size] for i in range(0, len(kw_list), batch_size)]
+    max_batches = min(len(batches), 15)
+    per_batch_count = max(200, total_input // max_batches) if max_batches > 0 else 200
+
+    call_num = 0
+    for batch_idx in range(max_batches):
+        batch = batches[batch_idx]
+        prompt_idx = batch_idx % len(SCRAPE_PROMPTS)
+        prompt = SCRAPE_PROMPTS[prompt_idx].format(
+            count=per_batch_count,
+            keywords="\n".join(batch)
+        )
+
+        try:
+            response = await g4f_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.choices[0].message.content or ""
+            count_before = len(new_kw)
+            for line in text.splitlines():
+                cleaned = _clean_ai_line(line)
+                if not cleaned or len(cleaned) <= 2 or len(cleaned) >= 200 or cleaned.startswith("http"):
+                    continue
+                if cleaned not in input_set:
+                    if brands and any(b in cleaned for b in brands):
+                        new_kw.add(cleaned)
+                    elif not brands:
+                        new_kw.add(cleaned)
+            added = len(new_kw) - count_before
+            call_num += 1
+            logger.info("SCRAPE call %d: +%d keywords (total new: %d)", call_num, added, len(new_kw))
+
+            if call_num % 3 == 0 or call_num == max_batches:
+                try:
+                    await status_msg.edit_text(
+                        f"🧲 *Keyword Scraper — AI Processing*\n{DIV}\n\n"
+                        f"   Input keywords: `{total_input}`\n"
+                        f"   AI batches: `{call_num}/{max_batches}`\n"
+                        f"   New keywords: `{len(new_kw)}`\n\n"
+                        f"{pbar(call_num, max_batches)}\n\n"
+                        f"⏳ 🤖 Expanding\\.\\.\\.",
+                        parse_mode=ParseMode.MARKDOWN_V2)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error("SCRAPE call %d error: %s", call_num, e)
+            continue
+
+    return new_kw
+
+def _extract_common_words(keywords, min_freq=0.15):
+    word_count = {}
+    total = len(keywords)
+    for kw in keywords:
+        words = set(kw.lower().split())
+        for w in words:
+            if len(w) > 2 and w not in {"the", "and", "for", "with", "from", "how", "what", "this", "that", "are", "was", "has", "have", "not", "but", "can", "all", "its", "you", "your"}:
+                word_count[w] = word_count.get(w, 0) + 1
+    threshold = max(total * min_freq, 3)
+    common = [w for w, c in sorted(word_count.items(), key=lambda x: -x[1]) if c >= threshold]
+    return common[:5]
+
 async def generate_keywords(session, brand, max_count, status_msg, sem):
     all_kw = set()
     all_kw.add(brand)
@@ -1073,6 +1182,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔤  Single Site", callback_data='kw_single')],
             [InlineKeyboardButton("📦  Multi-Keyword (Bulk)", callback_data='kw_multi')],
+            [InlineKeyboardButton("🧲  Keyword Scraper", callback_data='kw_scrape')],
             [InlineKeyboardButton("⬅️  Back to Menu", callback_data='back_menu')],
         ])
         text = (
@@ -1082,9 +1192,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔤 *Single Site*\n"
             f"   _Enter one brand/site, generate keywords_\n\n"
             f"📦 *Multi\\-Keyword \\(Bulk\\)*\n"
-            f"   _Enter multiple brands/keywords at once_\n"
-            f"   _Generates for ALL, merges into one file_\n\n"
-            f"🆓 Both are *free* — no license needed\\!"
+            f"   _Enter multiple brands at once, merge results_\n\n"
+            f"🧲 *Keyword Scraper*\n"
+            f"   _Feed existing keywords, AI expands them 10x_\n"
+            f"   _Perfect for turning 100 into 1000\\+_\n\n"
+            f"🆓 All modes are *free* — no license needed\\!"
         )
         await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
         return
@@ -1112,6 +1224,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"_Total output \\= count × number of brands_"
         )
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    if data == 'kw_scrape':
+        user_states[uid] = {"mode": "KEYWORD", "step": "scrape_input", "kw_type": "scrape"}
+        bk = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️  Back", callback_data='mode_kw')],
+        ])
+        text = (
+            f"🧲 *Keyword Scraper*\n{DIV}\n\n"
+            f"Feed me your *existing keywords* and AI will\n"
+            f"expand them into *10x more* related keywords\\.\n\n"
+            f"📝 *How to send:*\n"
+            f"• Paste keywords below \\(one per line\\)\n"
+            f"• Or upload a `.txt` file\n\n"
+            f"💡 _Works best with 50\\-5000 input keywords_\n"
+            f"_AI analyzes patterns \\& generates variations_\n\n"
+            f"🆓 *Free* — no license needed\\!"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
         return
 
     if data.startswith('kwcount_'):
@@ -1571,6 +1702,57 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
         await update.message.reply_document(
             document=out,
             caption=f"📦 {len(kw_list)} UHQ keywords from {len(brands)} brands")
+        return
+
+    # ── KEYWORD SCRAPER — expand existing keywords via AI ──
+    if mode == "KEYWORD" and step == "scrape_input":
+        input_keywords = [l.strip().lower() for l in lines if l.strip() and len(l.strip()) > 2]
+        input_keywords = list(dict.fromkeys(input_keywords))
+
+        if len(input_keywords) < 5:
+            await update.message.reply_text(
+                "⚠️ *Too few keywords\\!*\n\nSend at least 5 keywords for the scraper to work\\.",
+                parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        brands_detected = _extract_common_words(input_keywords)
+        brands_display = ", ".join(brands_detected[:3]) if brands_detected else "auto\\-detect"
+
+        status = await update.message.reply_text(
+            f"🧲 *Keyword Scraper — Starting*\n{DIV}\n\n"
+            f"   Input keywords: `{len(input_keywords)}`\n"
+            f"   Detected themes: `{esc(brands_display)}`\n\n"
+            f"{pbar(0, 1)}\n\n"
+            f"⏳ 🤖 AI analyzing patterns \\& expanding\\.\\.\\.",
+            parse_mode=ParseMode.MARKDOWN_V2)
+
+        new_kw = await ai_scrape_expand(input_keywords, status)
+
+        all_kw = set(input_keywords) | new_kw
+        kw_list = list(all_kw)
+        random.shuffle(kw_list)
+
+        out = io.BytesIO("\n".join(kw_list).encode())
+        out.name = f"scraped_keywords_{len(kw_list)}.txt"
+
+        ud = get_user(uid_s)
+        ud["uses"] = ud.get("uses", 0) + 1
+        db[uid_s] = ud; save_db(db)
+
+        multiplier = f"{len(kw_list) / len(input_keywords):.1f}x" if input_keywords else "N/A"
+
+        await status.edit_text(
+            f"✅ *Keyword Scraper — Done\\!*\n{DIV}\n\n"
+            f"   Input: `{len(input_keywords)}` keywords\n"
+            f"   AI generated: `{len(new_kw)}` new\n"
+            f"   Total output: `{len(kw_list)}`\n"
+            f"   Expansion: *{esc(multiplier)}*\n\n"
+            f"{pbar(1, 1)}\n\n📄 File below ⬇️",
+            parse_mode=ParseMode.MARKDOWN_V2)
+
+        await update.message.reply_document(
+            document=out,
+            caption=f"🧲 {len(kw_list)} keywords ({len(input_keywords)} input → {len(new_kw)} new)")
         return
 
     # ── GENERATOR ──
