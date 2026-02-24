@@ -1,7 +1,27 @@
 {
   "8003049490": {
     "banned": false,
-    "uses": 8,
+    "uses": 10,
+    "license_expiry": null
+  },
+  "5803180946": {
+    "banned": false,
+    "uses": 0,
+    "license_expiry": null
+  },
+  "8368859527": {
+    "banned": false,
+    "uses": 0,
+    "license_expiry": null
+  },
+  "7267670979": {
+    "banned": false,
+    "uses": 0,
+    "license_expiry": null
+  },
+  "7214730073": {
+    "banned": false,
+    "uses": 0,
     "license_expiry": null
   }
 }

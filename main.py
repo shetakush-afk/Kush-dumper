@@ -950,6 +950,59 @@ def is_banned(uid):
     return db.get(str(uid), {}).get("banned", False)
 
 # ──────────────────────────────────────────────
+#  ANTI-PUBLIC CHECKER
+# ──────────────────────────────────────────────
+
+ANTI_PUBLIC_THRESHOLDS = {
+    "anti_public": 50000,
+    "semi_public": 500000,
+}
+
+async def fetch_result_count(session, keyword, sem):
+    async with sem:
+        async with global_queue.slot():
+            url = "https://realtime.oxylabs.io/v1/queries"
+            payload = {
+                "source": "google_search",
+                "query": f'"{keyword}"',
+                "user_agent_type": "desktop_chrome",
+                "parse": True,
+                "start_page": 1,
+                "pages": 1,
+                "limit": 1,
+            }
+            try:
+                async with session.post(
+                    url, auth=aiohttp.BasicAuth(OXY_USER, OXY_PASS),
+                    json=payload, timeout=aiohttp.ClientTimeout(total=30),
+                ) as r:
+                    if r.status != 200:
+                        return keyword, -1
+                    data = await r.json()
+                    total = 0
+                    for page in data.get("results", []):
+                        content = page.get("content", {})
+                        total = content.get("results", {}).get("total_results_count", 0)
+                        if not isinstance(total, int):
+                            try:
+                                total = int(str(total).replace(",", "").replace(".", ""))
+                            except (ValueError, TypeError):
+                                total = 0
+                    return keyword, total
+            except Exception as e:
+                logger.error("AntiPublic err for '%s': %s", keyword[:50], e)
+                return keyword, -1
+
+def classify_keyword(result_count):
+    if result_count < 0:
+        return "error"
+    if result_count <= ANTI_PUBLIC_THRESHOLDS["anti_public"]:
+        return "anti_public"
+    if result_count <= ANTI_PUBLIC_THRESHOLDS["semi_public"]:
+        return "semi_public"
+    return "public"
+
+# ──────────────────────────────────────────────
 #  STATIC TEXTS
 # ──────────────────────────────────────────────
 
@@ -961,24 +1014,25 @@ WELCOME = (
     "  1️⃣  🔤 Keyword Maker \\→ AI\\-powered keywords\n"
     "  2️⃣  🛠 Dork Generator \\→ build dorks\n"
     "  3️⃣  🔎 Deep Parser \\→ get real URLs\n\n"
+    "🔑 *License required for all features*\n\n"
     f"{DIV}"
 )
 
 HELP = (
     "❓ *How to Use This Bot*\n"
     f"{DIV}\n\n"
-    "🔤 *Keyword Maker*  \\(FREE\\)\n"
-    "  Give a site \\(e\\.g\\. `netflix.com`\\)\n"
-    "  🤖 *AI\\-Powered* \\+ Google scraping \\+ algorithmic\\.\n"
-    "  Generates massive UHQ keyword lists\\.\n"
-    "  Set any custom count \\(50\\-50000\\)\\.\n\n"
-    "🛠 *Dork Generator*  \\(FREE\\)\n"
+    "🔤 *Keyword Maker*  \\(License Required\\)\n"
+    "  Single Site, Multi\\-Keyword, Keyword Scraper\n"
+    "  🤖 *AI\\-Powered* \\+ Google scraping\\.\n"
+    "  Generates massive UHQ keyword lists\\.\n\n"
+    "🛠 *Dork Generator*  \\(License Required\\)\n"
     "  3 presets \\(Combo, Shopping, CC SQLi\\)\n"
-    "  \\+ Custom Builder with full control\\.\n"
-    "  Set any custom count\\.\n\n"
+    "  \\+ Custom Builder with full control\\.\n\n"
     "🔎 *Deep Parser*  \\(License Required\\)\n"
-    "  Scrapes Google with 5 threads\\.\n"
-    "  Requires an active license key\\.\n\n"
+    "  Scrapes Google with 5 threads\\.\n\n"
+    "🔍 *Anti\\-Public Checker*  \\(License Required\\)\n"
+    "  Checks keywords against Google\\.\n"
+    "  Separates rare vs overused keywords\\.\n\n"
     f"{DIV}\n"
     "🔑 *License System:*\n"
     "  Purchase a license key from the owner\\.\n"
@@ -1178,25 +1232,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #  KEYWORD MAKER
     # ══════════════════════════════════════════
     if data == 'mode_kw':
+        if not user_has_license(uid):
+            await q.edit_message_text(
+                f"🔴 *License Required*\n{DIV}\n\n"
+                f"Keyword Maker requires an active license\\.\n\n"
+                f"Contact the owner to purchase a license key,\n"
+                f"then activate with /redeem `KEY`\\.",
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=back_kb())
+            return
         user_states[uid] = {"mode": "KEYWORD", "step": "choose_kw_type"}
+        remaining = get_license_remaining(uid)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔤  Single Site", callback_data='kw_single')],
             [InlineKeyboardButton("📦  Multi-Keyword (Bulk)", callback_data='kw_multi')],
             [InlineKeyboardButton("🧲  Keyword Scraper", callback_data='kw_scrape')],
+            [InlineKeyboardButton("🔍  Anti-Public Checker", callback_data='kw_antipub')],
             [InlineKeyboardButton("⬅️  Back to Menu", callback_data='back_menu')],
         ])
         text = (
             f"🔤 *Keyword Maker*\n{DIV}\n\n"
-            f"🤖 *AI\\-Powered* \\+ Google scraping \\+ algorithmic\\.\n\n"
+            f"🤖 *AI\\-Powered* \\+ Google scraping \\+ algorithmic\\.\n"
+            f"🟢 License: `{esc(remaining or '')}`\n\n"
             f"Choose a mode:\n\n"
             f"🔤 *Single Site*\n"
             f"   _Enter one brand/site, generate keywords_\n\n"
             f"📦 *Multi\\-Keyword \\(Bulk\\)*\n"
             f"   _Enter multiple brands at once, merge results_\n\n"
             f"🧲 *Keyword Scraper*\n"
-            f"   _Feed existing keywords, AI expands them 10x_\n"
-            f"   _Perfect for turning 100 into 1000\\+_\n\n"
-            f"🆓 All modes are *free* — no license needed\\!"
+            f"   _Feed existing keywords, AI expands them 10x_\n\n"
+            f"🔍 *Anti\\-Public Checker*\n"
+            f"   _Check keywords rarity, keep only UHQ ones_"
         )
         await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
         return
@@ -1239,8 +1304,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Paste keywords below \\(one per line\\)\n"
             f"• Or upload a `.txt` file\n\n"
             f"💡 _Works best with 50\\-5000 input keywords_\n"
-            f"_AI analyzes patterns \\& generates variations_\n\n"
-            f"🆓 *Free* — no license needed\\!"
+            f"_AI analyzes patterns \\& generates variations_"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
+        return
+
+    if data == 'kw_antipub':
+        user_states[uid] = {"mode": "KEYWORD", "step": "antipub_input", "kw_type": "antipub"}
+        bk = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️  Back", callback_data='mode_kw')],
+        ])
+        text = (
+            f"🔍 *Anti\\-Public Checker*\n{DIV}\n\n"
+            f"Send me your *keywords* and I'll check each\n"
+            f"one against Google to find the *rare UHQ* ones\\.\n\n"
+            f"📊 *Output \\(3 files\\):*\n"
+            f"   🟢 Anti\\-Public — rare, high value\n"
+            f"   🟡 Semi\\-Public — moderate usage\n"
+            f"   🔴 Public — overused, low value\n\n"
+            f"📝 *How to send:*\n"
+            f"• Paste keywords below \\(one per line\\)\n"
+            f"• Or upload a `.txt` file\n\n"
+            f"💡 _Best with 50\\-2000 keywords_"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
         return
@@ -1321,6 +1406,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #  DORK GENERATOR MENU
     # ══════════════════════════════════════════
     if data == 'mode_gen':
+        if not user_has_license(uid):
+            await q.edit_message_text(
+                f"🔴 *License Required*\n{DIV}\n\n"
+                f"Dork Generator requires an active license\\.\n\n"
+                f"Contact the owner to purchase a license key,\n"
+                f"then activate with /redeem `KEY`\\.",
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=back_kb())
+            return
         user_states[uid] = {"mode": "GENERATOR", "step": "choose_type"}
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎯  Site Targeted Combo", callback_data='preset_combo')],
@@ -1397,8 +1490,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   Templates: `{len(preset.get('templates',[]))}` patterns\n"
             f"   Max dorks: `{max_count}`\n\n"
             f"✏️ Now send me your *keywords*\n"
-            f"\\(one per line, or upload a \\.txt file\\)\n\n"
-            f"🆓 *Free* — no license needed\\!"
+            f"\\(one per line, or upload a \\.txt file\\)"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
         return
@@ -1489,8 +1581,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   Site scope: {site.get('icon','')} *{esc(site.get('label',''))}*\n"
             f"   Parameters: {pp.get('icon','')} *{esc(pp.get('label',''))}*\n"
             f"   Max dorks: `{max_count}`\n\n"
-            f"✏️ Send *keywords* \\(text or \\.txt file\\)\n\n"
-            f"🆓 *Free* — no license needed\\!"
+            f"✏️ Send *keywords* \\(text or \\.txt file\\)"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
         return
@@ -1753,6 +1844,127 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
         await update.message.reply_document(
             document=out,
             caption=f"🧲 {len(kw_list)} keywords ({len(input_keywords)} input → {len(new_kw)} new)")
+        return
+
+    # ── ANTI-PUBLIC CHECKER ──
+    if mode == "KEYWORD" and step == "antipub_input":
+        input_keywords = [l.strip() for l in lines if l.strip() and len(l.strip()) > 2]
+        input_keywords = list(dict.fromkeys(input_keywords))
+
+        if len(input_keywords) < 5:
+            await update.message.reply_text(
+                "⚠️ *Too few keywords\\!*\n\nSend at least 5 keywords to check\\.",
+                parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        if len(input_keywords) > 5000:
+            await update.message.reply_text(
+                "⚠️ *Too many keywords\\!* Maximum is 5000 at once\\.",
+                parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        status = await update.message.reply_text(
+            f"🔍 *Anti\\-Public Checker — Starting*\n{DIV}\n\n"
+            f"   Keywords to check: `{len(input_keywords)}`\n\n"
+            f"{pbar(0, len(input_keywords))}\n\n"
+            f"⏳ Checking against Google\\.\\.\\.",
+            parse_mode=ParseMode.MARKDOWN_V2)
+
+        sem = get_semaphore(uid)
+        anti_public = []
+        semi_public = []
+        public = []
+        errors = 0
+        done_count = 0
+        lock = asyncio.Lock()
+
+        async def _check_kw(kw):
+            nonlocal done_count, errors
+            async with aiohttp.ClientSession() as sess:
+                keyword, count = await fetch_result_count(sess, kw, sem)
+            cat = classify_keyword(count)
+            async with lock:
+                if cat == "anti_public":
+                    anti_public.append((keyword, count))
+                elif cat == "semi_public":
+                    semi_public.append((keyword, count))
+                elif cat == "public":
+                    public.append((keyword, count))
+                else:
+                    errors += 1
+                done_count += 1
+                d = done_count
+            if d % 10 == 0 or d == len(input_keywords):
+                try:
+                    await status.edit_text(
+                        f"🔍 *Anti\\-Public Checker — Running*\n{DIV}\n\n"
+                        f"   Checked: `{d}/{len(input_keywords)}`\n"
+                        f"   🟢 Anti\\-Public: `{len(anti_public)}`\n"
+                        f"   🟡 Semi\\-Public: `{len(semi_public)}`\n"
+                        f"   🔴 Public: `{len(public)}`\n\n"
+                        f"{pbar(d, len(input_keywords))}\n\n"
+                        f"⏳ Please wait\\.\\.\\.",
+                        parse_mode=ParseMode.MARKDOWN_V2)
+                except Exception:
+                    pass
+
+        batch_size = 10
+        for i in range(0, len(input_keywords), batch_size):
+            batch = input_keywords[i:i+batch_size]
+            await asyncio.gather(*[_check_kw(kw) for kw in batch], return_exceptions=True)
+
+        ud = get_user(uid_s)
+        ud["uses"] = ud.get("uses", 0) + 1
+        db[uid_s] = ud; save_db(db)
+
+        total = len(input_keywords)
+        ap_pct = int(100 * len(anti_public) / total) if total else 0
+        sp_pct = int(100 * len(semi_public) / total) if total else 0
+        pb_pct = int(100 * len(public) / total) if total else 0
+        err_note = f"\n   ⚠️ Errors: `{errors}`" if errors else ""
+
+        summary = (
+            f"✅ *Anti\\-Public Check — Done\\!*\n{DIV}\n\n"
+            f"   Total checked: `{total}`\n\n"
+            f"   🟢 Anti\\-Public \\(rare\\): `{len(anti_public)}` \\({ap_pct}%\\)\n"
+            f"   🟡 Semi\\-Public: `{len(semi_public)}` \\({sp_pct}%\\)\n"
+            f"   🔴 Public \\(overused\\): `{len(public)}` \\({pb_pct}%\\){err_note}\n\n"
+            f"{pbar(1, 1)}\n\n📄 Files below ⬇️"
+        )
+        await status.edit_text(summary, parse_mode=ParseMode.MARKDOWN_V2)
+
+        anti_public.sort(key=lambda x: x[1])
+        semi_public.sort(key=lambda x: x[1])
+        public.sort(key=lambda x: x[1])
+
+        if anti_public:
+            content = "\n".join([kw for kw, _ in anti_public])
+            f_ap = io.BytesIO(content.encode())
+            f_ap.name = f"anti_public_{len(anti_public)}.txt"
+            await update.message.reply_document(
+                document=f_ap,
+                caption=f"🟢 {len(anti_public)} Anti-Public (rare/UHQ) keywords")
+
+        if semi_public:
+            content = "\n".join([kw for kw, _ in semi_public])
+            f_sp = io.BytesIO(content.encode())
+            f_sp.name = f"semi_public_{len(semi_public)}.txt"
+            await update.message.reply_document(
+                document=f_sp,
+                caption=f"🟡 {len(semi_public)} Semi-Public keywords")
+
+        if public:
+            content = "\n".join([kw for kw, _ in public])
+            f_pb = io.BytesIO(content.encode())
+            f_pb.name = f"public_{len(public)}.txt"
+            await update.message.reply_document(
+                document=f_pb,
+                caption=f"🔴 {len(public)} Public (overused) keywords")
+
+        if not anti_public and not semi_public and not public:
+            await update.message.reply_text(
+                "⚠️ Could not check any keywords\\. Try again later\\.",
+                parse_mode=ParseMode.MARKDOWN_V2)
         return
 
     # ── GENERATOR ──
