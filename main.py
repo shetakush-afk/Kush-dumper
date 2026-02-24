@@ -10,7 +10,12 @@ import traceback
 import aiohttp
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
-from g4f.client import AsyncClient as G4FClient
+try:
+    from g4f.client import AsyncClient as G4FClient
+    G4F_AVAILABLE = True
+except ImportError:
+    G4F_AVAILABLE = False
+    G4FClient = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -309,7 +314,7 @@ AI_PROMPTS = [
     ),
 ]
 
-g4f_client = G4FClient()
+g4f_client = G4FClient() if G4F_AVAILABLE else None
 
 def _clean_ai_line(line):
     line = line.strip()
@@ -319,7 +324,7 @@ def _clean_ai_line(line):
     return line
 
 async def ai_expand_keywords(brand, existing_kw, target_count):
-    if not AI_ENABLED:
+    if not AI_ENABLED or not g4f_client:
         return set()
 
     new_kw = set()
@@ -391,7 +396,7 @@ SCRAPE_PROMPTS = [
 ]
 
 async def ai_scrape_expand(input_keywords, status_msg):
-    if not AI_ENABLED:
+    if not AI_ENABLED or not g4f_client:
         return set()
 
     new_kw = set()
@@ -973,6 +978,10 @@ async def ai_check_antipub(keywords, status_msg):
     anti_public = []
     semi_public = []
     public = []
+
+    if not g4f_client:
+        semi_public = list(keywords)
+        return anti_public, semi_public, public
 
     input_map = {k.lower().strip(): k for k in keywords}
     all_input = set(input_map.keys())
