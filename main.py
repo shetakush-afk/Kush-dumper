@@ -1069,49 +1069,97 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #  KEYWORD MAKER
     # ══════════════════════════════════════════
     if data == 'mode_kw':
-        user_states[uid] = {"mode": "KEYWORD", "step": "count"}
-        rows = count_kb("kwcount")
-        rows.append([InlineKeyboardButton("⬅️  Back to Menu", callback_data='back_menu')])
+        user_states[uid] = {"mode": "KEYWORD", "step": "choose_kw_type"}
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔤  Single Site", callback_data='kw_single')],
+            [InlineKeyboardButton("📦  Multi-Keyword (Bulk)", callback_data='kw_multi')],
+            [InlineKeyboardButton("⬅️  Back to Menu", callback_data='back_menu')],
+        ])
         text = (
             f"🔤 *Keyword Maker*\n{DIV}\n\n"
-            f"Generates UHQ keywords from any site name\\.\n"
             f"🤖 *AI\\-Powered* \\+ Google scraping \\+ algorithmic\\.\n\n"
+            f"Choose a mode:\n\n"
+            f"🔤 *Single Site*\n"
+            f"   _Enter one brand/site, generate keywords_\n\n"
+            f"📦 *Multi\\-Keyword \\(Bulk\\)*\n"
+            f"   _Enter multiple brands/keywords at once_\n"
+            f"   _Generates for ALL, merges into one file_\n\n"
+            f"🆓 Both are *free* — no license needed\\!"
+        )
+        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    if data == 'kw_single':
+        user_states[uid] = {"mode": "KEYWORD", "step": "count", "kw_type": "single"}
+        rows = count_kb("kwcount")
+        rows.append([InlineKeyboardButton("⬅️  Back", callback_data='mode_kw')])
+        text = (
+            f"🔤 *Single Site — Choose Count*\n{DIV}\n\n"
             f"📊 *How many keywords* to generate?\n\n"
-            f"Pick a preset or type a custom number\\.\n\n"
-            f"🆓 This is *free* — no license needed\\!"
+            f"Pick a preset or type a custom number\\."
+        )
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    if data == 'kw_multi':
+        user_states[uid] = {"mode": "KEYWORD", "step": "count", "kw_type": "multi"}
+        rows = count_kb("kwcount")
+        rows.append([InlineKeyboardButton("⬅️  Back", callback_data='mode_kw')])
+        text = (
+            f"📦 *Multi\\-Keyword — Choose Count*\n{DIV}\n\n"
+            f"📊 *How many keywords per brand?*\n\n"
+            f"Pick a preset or type a custom number\\.\n"
+            f"_Total output \\= count × number of brands_"
         )
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
         return
 
     if data.startswith('kwcount_'):
         val = data.replace('kwcount_', '')
+        st = user_states.get(uid, {})
+        kw_type = st.get("kw_type", "single")
         if val == 'custom':
-            st = user_states.get(uid, {})
             st.update({"step": "custom_count"})
             user_states[uid] = st
+            back_target = f"kw_{kw_type}"
             bk = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️  Back", callback_data='mode_kw')],
+                [InlineKeyboardButton("⬅️  Back", callback_data=back_target)],
             ])
             await q.edit_message_text(
-                f"🔤 *Keyword Maker — Custom Count*\n{DIV}\n\n"
+                f"🔤 *Custom Count*\n{DIV}\n\n"
                 f"Type a number below \\(e\\.g\\. `1500`\\):\n",
                 parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
             return
         max_count = int(val)
-        st = user_states.get(uid, {})
-        st.update({"step": "site_input", "max_count": max_count})
-        user_states[uid] = st
-        bk = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️  Change Count", callback_data='mode_kw')],
-        ])
-        await q.edit_message_text(
-            f"🔤 *Keyword Maker — Enter Site*\n{DIV}\n\n"
-            f"   Keywords to generate: `{max_count}`\n\n"
-            f"✏️ Now send me a *site name or URL*\n\n"
-            f"💡 _Examples:_\n"
-            f"`netflix.com`\n`spotify`\n`amazon.com`\n",
-            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
-        return
+        if kw_type == "multi":
+            st.update({"step": "multi_input", "max_count": max_count})
+            user_states[uid] = st
+            bk = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️  Change Count", callback_data='kw_multi')],
+            ])
+            await q.edit_message_text(
+                f"📦 *Multi\\-Keyword — Enter Brands*\n{DIV}\n\n"
+                f"   Keywords per brand: `{max_count}`\n\n"
+                f"✏️ Send me *multiple brands/keywords*\n"
+                f"\\(one per line, or upload a \\.txt file\\)\n\n"
+                f"💡 _Example:_\n"
+                f"`netflix`\n`spotify`\n`amazon`\n`disney`\n`hulu`\n",
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
+            return
+        else:
+            st.update({"step": "site_input", "max_count": max_count})
+            user_states[uid] = st
+            bk = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️  Change Count", callback_data='kw_single')],
+            ])
+            await q.edit_message_text(
+                f"🔤 *Single Site — Enter Site*\n{DIV}\n\n"
+                f"   Keywords to generate: `{max_count}`\n\n"
+                f"✏️ Now send me a *site name or URL*\n\n"
+                f"💡 _Examples:_\n"
+                f"`netflix.com`\n`spotify`\n`amazon.com`\n",
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
+            return
 
     # ── Mode: Parser ──
     if data == 'mode_parse':
@@ -1350,15 +1398,27 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
         st["max_count"] = num
 
         if mode == "KEYWORD":
-            st["step"] = "site_input"
-            user_states[uid] = st
-            await update.message.reply_text(
-                f"🔤 *Keyword Maker — Enter Site*\n{DIV}\n\n"
-                f"   Keywords to generate: `{num}`\n\n"
-                f"✏️ Send me a *site name or URL*\n\n"
-                f"💡 _Examples:_ `netflix.com`, `spotify`, `amazon`\n",
-                parse_mode=ParseMode.MARKDOWN_V2)
-            return
+            kw_type = st.get("kw_type", "single")
+            if kw_type == "multi":
+                st["step"] = "multi_input"
+                user_states[uid] = st
+                await update.message.reply_text(
+                    f"📦 *Multi\\-Keyword — Enter Brands*\n{DIV}\n\n"
+                    f"   Keywords per brand: `{num}`\n\n"
+                    f"✏️ Send *multiple brands/keywords*\n"
+                    f"\\(one per line, or upload a \\.txt file\\)\n",
+                    parse_mode=ParseMode.MARKDOWN_V2)
+                return
+            else:
+                st["step"] = "site_input"
+                user_states[uid] = st
+                await update.message.reply_text(
+                    f"🔤 *Keyword Maker — Enter Site*\n{DIV}\n\n"
+                    f"   Keywords to generate: `{num}`\n\n"
+                    f"✏️ Send me a *site name or URL*\n\n"
+                    f"💡 _Examples:_ `netflix.com`, `spotify`, `amazon`\n",
+                    parse_mode=ParseMode.MARKDOWN_V2)
+                return
 
         if count_next == "preset_keywords":
             st["step"] = "keywords"
@@ -1383,7 +1443,7 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             return
         return
 
-    # ── KEYWORD MAKER — site input ──
+    # ── KEYWORD MAKER — single site input ──
     if mode == "KEYWORD" and step == "site_input":
         site_raw = lines[0].strip()
         brand = extract_brand(site_raw)
@@ -1394,7 +1454,7 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             f"🔤 *Keyword Maker — Starting*\n{DIV}\n\n"
             f"   Site: `{esc(brand)}`\n"
             f"   Target: `{max_count}` keywords\n\n{pbar(0, 1)}\n\n"
-            f"⏳ Scraping Google \\+ expanding\\.\\.\\.",
+            f"⏳ Scraping Google \\+ AI \\+ expanding\\.\\.\\.",
             parse_mode=ParseMode.MARKDOWN_V2)
 
         kw_sem = get_semaphore(uid)
@@ -1419,6 +1479,98 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
         await update.message.reply_document(
             document=out,
             caption=f"🔤 {len(keywords)} UHQ keywords for {brand}")
+        return
+
+    # ── KEYWORD MAKER — multi-keyword bulk input ──
+    if mode == "KEYWORD" and step == "multi_input":
+        brands = []
+        for line in lines:
+            b = extract_brand(line.strip())
+            if b and len(b) > 1:
+                brands.append(b)
+        brands = list(dict.fromkeys(brands))
+
+        if not brands:
+            await update.message.reply_text(
+                "⚠️ *No valid brands found\\!*\n\nSend brand names, one per line\\.",
+                parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        if len(brands) > 50:
+            await update.message.reply_text(
+                "⚠️ *Too many brands\\!* Maximum is 50 at once\\.",
+                parse_mode=ParseMode.MARKDOWN_V2)
+            return
+
+        max_per_brand = st.get("max_count", 500)
+        total_target = max_per_brand * len(brands)
+        brands_display = ", ".join(brands[:5])
+        if len(brands) > 5:
+            brands_display += f" \\+{len(brands) - 5} more"
+
+        status = await update.message.reply_text(
+            f"📦 *Multi\\-Keyword — Starting*\n{DIV}\n\n"
+            f"   Brands: `{len(brands)}`\n"
+            f"   Per brand: `{max_per_brand}` keywords\n"
+            f"   Total target: `{total_target}`\n\n"
+            f"   Processing: `{esc(brands_display)}`\n\n"
+            f"{pbar(0, len(brands))}\n\n"
+            f"⏳ This may take a while\\.\\.\\.",
+            parse_mode=ParseMode.MARKDOWN_V2)
+
+        all_keywords = set()
+        kw_sem = get_semaphore(uid)
+        per_brand_counts = {}
+
+        async with aiohttp.ClientSession() as session:
+            for i, brand in enumerate(brands):
+                try:
+                    await status.edit_text(
+                        f"📦 *Multi\\-Keyword — Processing*\n{DIV}\n\n"
+                        f"   Brands: `{i + 1}/{len(brands)}`\n"
+                        f"   Current: `{esc(brand)}`\n"
+                        f"   Total keywords: `{len(all_keywords)}`\n\n"
+                        f"{pbar(i, len(brands))}\n\n"
+                        f"⏳ 🤖 AI \\+ Google \\+ algorithmic\\.\\.\\.",
+                        parse_mode=ParseMode.MARKDOWN_V2)
+                except Exception:
+                    pass
+
+                brand_kw = await generate_keywords(session, brand, max_per_brand, status, kw_sem)
+                before = len(all_keywords)
+                all_keywords.update(brand_kw)
+                added = len(all_keywords) - before
+                per_brand_counts[brand] = added
+                logger.info("MULTI-KW: brand='%s' generated=%d unique_added=%d total=%d",
+                            brand, len(brand_kw), added, len(all_keywords))
+
+        kw_list = list(all_keywords)
+        random.shuffle(kw_list)
+
+        out = io.BytesIO("\n".join(kw_list).encode())
+        out.name = f"bulk_keywords_{len(brands)}brands_{len(kw_list)}.txt"
+
+        ud = get_user(uid_s)
+        ud["uses"] = ud.get("uses", 0) + 1
+        db[uid_s] = ud; save_db(db)
+
+        top_brands = sorted(per_brand_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        breakdown = "\n".join([f"   `{esc(b)}`: {c}" for b, c in top_brands])
+        if len(brands) > 5:
+            breakdown += f"\n   _\\.\\.\\. and {len(brands) - 5} more_"
+
+        await status.edit_text(
+            f"✅ *Multi\\-Keyword — Done\\!*\n{DIV}\n\n"
+            f"   Brands processed: `{len(brands)}`\n"
+            f"   Total keywords: `{len(kw_list)}`\n"
+            f"   Per brand target: `{max_per_brand}`\n\n"
+            f"📊 *Breakdown:*\n{breakdown}\n\n"
+            f"{pbar(1, 1)}\n\n📄 File below ⬇️",
+            parse_mode=ParseMode.MARKDOWN_V2)
+
+        await update.message.reply_document(
+            document=out,
+            caption=f"📦 {len(kw_list)} UHQ keywords from {len(brands)} brands")
         return
 
     # ── GENERATOR ──
