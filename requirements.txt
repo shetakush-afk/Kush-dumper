@@ -1,3 +1,2 @@
 python-telegram-bot==21.*
-requests
-beautifulsoup4
+aiohttp

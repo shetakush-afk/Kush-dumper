@@ -1,0 +1,8 @@
+2026-02-26 10:37:00,541 - AlephBot - INFO - Starting bot...
+2026-02-26 10:37:00,612 - AlephBot - INFO - Bot ready — polling...
+2026-02-26 10:37:01,109 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7545064228:AAHYqBGcXGJpK1WUp68-uuLZjMjTiPEPb2o/getMe "HTTP/1.1 200 OK"
+2026-02-26 10:37:01,273 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7545064228:AAHYqBGcXGJpK1WUp68-uuLZjMjTiPEPb2o/deleteWebhook "HTTP/1.1 200 OK"
+2026-02-26 10:37:01,274 - telegram.ext.Application - INFO - Application started
+2026-02-26 10:37:11,777 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7545064228:AAHYqBGcXGJpK1WUp68-uuLZjMjTiPEPb2o/getUpdates "HTTP/1.1 200 OK"
+2026-02-26 10:37:21,943 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7545064228:AAHYqBGcXGJpK1WUp68-uuLZjMjTiPEPb2o/getUpdates "HTTP/1.1 200 OK"
+2026-02-26 10:37:32,111 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7545064228:AAHYqBGcXGJpK1WUp68-uuLZjMjTiPEPb2o/getUpdates "HTTP/1.1 200 OK"
