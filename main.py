@@ -389,20 +389,66 @@ async def generate_keywords(session, brand, max_count, status_msg, sem):
 
         logger.info("KW Step2: crawled %d pages, total %d keywords for '%s'", crawl_done, len(all_kw), brand)
 
-    # ── Step 3: Finalize ──
+    # ── Step 3: Anti-Public Check ──
+    kw_list = list(all_kw)
+    random.shuffle(kw_list)
+    kw_list = kw_list[:max_count]
+
+    if not kw_list:
+        return [], [], []
+
     try:
         await status_msg.edit_text(
-            f"🔤 *Keyword Maker — Step 3: Finalizing*\n{DIV}\n\n"
+            f"🔤 *Keyword Maker — Step 3: Anti\\-Public Check*\n{DIV}\n\n"
             f"   Brand: `{esc(brand)}`\n"
-            f"   Total keywords: `{len(all_kw)}`\n\n"
-            f"{pbar(2, 3)}",
+            f"   Keywords to check: `{len(kw_list)}`\n"
+            f"   ⚡ {ANTIPUB_CONCURRENCY} concurrent Google checks\n\n"
+            f"{pbar(0, len(kw_list))}",
             parse_mode=ParseMode.MARKDOWN_V2)
     except Exception:
         pass
 
-    kw_list = list(all_kw)
-    random.shuffle(kw_list)
-    return kw_list[:max_count]
+    antipub_sem = asyncio.Semaphore(ANTIPUB_CONCURRENCY)
+    anti_public = []
+    semi_public = []
+    public = []
+    done_count = 0
+    lock = asyncio.Lock()
+    total = len(kw_list)
+
+    async def _check(kw):
+        nonlocal done_count
+        keyword, count = await google_check_keyword(session, kw, antipub_sem)
+        async with lock:
+            if count < 0:
+                semi_public.append(keyword)
+            elif count <= ANTIPUB_THRESHOLDS["rare"]:
+                anti_public.append(keyword)
+            elif count <= ANTIPUB_THRESHOLDS["moderate"]:
+                semi_public.append(keyword)
+            else:
+                public.append(keyword)
+            done_count += 1
+            d = done_count
+        if d % 20 == 0 or d == total:
+            try:
+                await status_msg.edit_text(
+                    f"🔤 *Step 3: Anti\\-Public Check*\n{DIV}\n\n"
+                    f"   Checked: `{d}/{total}`\n"
+                    f"   🟢 Rare: `{len(anti_public)}`\n"
+                    f"   🟡 Moderate: `{len(semi_public)}`\n"
+                    f"   🔴 Public: `{len(public)}`\n\n"
+                    f"{pbar(d, total)}",
+                    parse_mode=ParseMode.MARKDOWN_V2)
+            except Exception:
+                pass
+
+    for i in range(0, total, ANTIPUB_CONCURRENCY):
+        batch = kw_list[i:i+ANTIPUB_CONCURRENCY]
+        await asyncio.gather(*[_check(kw) for kw in batch], return_exceptions=True)
+
+    logger.info("KW Step3: anti=%d semi=%d public=%d for '%s'", len(anti_public), len(semi_public), len(public), brand)
+    return anti_public, semi_public, public
 
 
 # ──────────────────────────────────────────────
@@ -1459,31 +1505,55 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             f"🔤 *Keyword Maker — Starting*\n{DIV}\n\n"
             f"   Site: `{esc(brand)}`\n"
             f"   Target: `{max_count}` keywords\n\n{pbar(0, 1)}\n\n"
-            f"⏳ Scraping Google \\+ AI \\+ expanding\\.\\.\\.",
+            f"⏳ Google scrape → crawl → anti\\-public check\\.\\.\\.",
             parse_mode=ParseMode.MARKDOWN_V2)
 
         kw_sem = get_semaphore(uid)
         async with aiohttp.ClientSession() as session:
-            keywords = await generate_keywords(session, brand, max_count, status, kw_sem)
+            anti_public, semi_public, public = await generate_keywords(session, brand, max_count, status, kw_sem)
 
-        out = io.BytesIO("\n".join(keywords).encode())
-        out.name = f"keywords_{brand}_{len(keywords)}.txt"
-
+        total = len(anti_public) + len(semi_public) + len(public)
         ud = get_user(uid_s)
         ud["uses"] = ud.get("uses", 0) + 1
         db[uid_s] = ud; save_db(db)
 
+        ap_pct = int(100 * len(anti_public) / total) if total else 0
+        sp_pct = int(100 * len(semi_public) / total) if total else 0
+        pb_pct = int(100 * len(public) / total) if total else 0
+
         await status.edit_text(
-            f"✅ *Keywords Generated\\!*\n{DIV}\n\n"
-            f"   Site: `{esc(brand)}`\n"
-            f"   Generated: `{len(keywords)}`\n"
-            f"   Requested: `{max_count}`\n\n{pbar(1, 1)}\n\n"
-            f"📄 File attached below ⬇️",
+            f"✅ *Keywords Done — {esc(brand)}*\n{DIV}\n\n"
+            f"   Total scraped: `{total}`\n\n"
+            f"   🟢 Anti\\-Public \\(UHQ\\): `{len(anti_public)}` \\({ap_pct}%\\)\n"
+            f"   🟡 Semi\\-Public: `{len(semi_public)}` \\({sp_pct}%\\)\n"
+            f"   🔴 Public: `{len(public)}` \\({pb_pct}%\\)\n\n"
+            f"{pbar(1, 1)}\n\n📄 Files below ⬇️",
             parse_mode=ParseMode.MARKDOWN_V2)
 
-        await update.message.reply_document(
-            document=out,
-            caption=f"🔤 {len(keywords)} UHQ keywords for {brand}")
+        if anti_public:
+            f_ap = io.BytesIO("\n".join(anti_public).encode())
+            f_ap.name = f"anti_public_{brand}_{len(anti_public)}.txt"
+            await update.message.reply_document(document=f_ap,
+                caption=f"🟢 {len(anti_public)} Anti-Public (rare/UHQ) keywords for {brand}")
+
+        if semi_public:
+            f_sp = io.BytesIO("\n".join(semi_public).encode())
+            f_sp.name = f"semi_public_{brand}_{len(semi_public)}.txt"
+            await update.message.reply_document(document=f_sp,
+                caption=f"🟡 {len(semi_public)} Semi-Public keywords for {brand}")
+
+        if public:
+            f_pb = io.BytesIO("\n".join(public).encode())
+            f_pb.name = f"public_{brand}_{len(public)}.txt"
+            await update.message.reply_document(document=f_pb,
+                caption=f"🔴 {len(public)} Public keywords for {brand}")
+
+        all_kw = anti_public + semi_public + public
+        if all_kw:
+            f_all = io.BytesIO("\n".join(all_kw).encode())
+            f_all.name = f"all_keywords_{brand}_{len(all_kw)}.txt"
+            await update.message.reply_document(document=f_all,
+                caption=f"📦 {len(all_kw)} total keywords for {brand}")
         return
 
     # ── KEYWORD MAKER — multi-keyword bulk input ──
@@ -1508,74 +1578,84 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             return
 
         max_per_brand = st.get("max_count", 500)
-        total_target = max_per_brand * len(brands)
-        brands_display = ", ".join(brands[:5])
-        if len(brands) > 5:
-            brands_display += f" \\+{len(brands) - 5} more"
 
         status = await update.message.reply_text(
             f"📦 *Multi\\-Keyword — Starting*\n{DIV}\n\n"
             f"   Brands: `{len(brands)}`\n"
-            f"   Per brand: `{max_per_brand}` keywords\n"
-            f"   Total target: `{total_target}`\n\n"
-            f"   Processing: `{esc(brands_display)}`\n\n"
+            f"   Per brand: `{max_per_brand}` keywords\n\n"
             f"{pbar(0, len(brands))}\n\n"
-            f"⏳ This may take a while\\.\\.\\.",
+            f"⏳ Scrape → crawl → anti\\-public for each\\.\\.\\.",
             parse_mode=ParseMode.MARKDOWN_V2)
 
-        all_keywords = set()
+        all_anti = []
+        all_semi = []
+        all_public = []
         kw_sem = get_semaphore(uid)
-        per_brand_counts = {}
 
         async with aiohttp.ClientSession() as session:
             for i, brand in enumerate(brands):
                 try:
                     await status.edit_text(
                         f"📦 *Multi\\-Keyword — Processing*\n{DIV}\n\n"
-                        f"   Brands: `{i + 1}/{len(brands)}`\n"
-                        f"   Current: `{esc(brand)}`\n"
-                        f"   Total keywords: `{len(all_keywords)}`\n\n"
-                        f"{pbar(i, len(brands))}\n\n"
-                        f"⏳ 🤖 AI \\+ Google \\+ algorithmic\\.\\.\\.",
+                        f"   Brand: `{i + 1}/{len(brands)}` — `{esc(brand)}`\n"
+                        f"   🟢 Anti\\-Public: `{len(all_anti)}`\n"
+                        f"   Total: `{len(all_anti) + len(all_semi) + len(all_public)}`\n\n"
+                        f"{pbar(i, len(brands))}",
                         parse_mode=ParseMode.MARKDOWN_V2)
                 except Exception:
                     pass
 
-                brand_kw = await generate_keywords(session, brand, max_per_brand, status, kw_sem)
-                before = len(all_keywords)
-                all_keywords.update(brand_kw)
-                added = len(all_keywords) - before
-                per_brand_counts[brand] = added
-                logger.info("MULTI-KW: brand='%s' generated=%d unique_added=%d total=%d",
-                            brand, len(brand_kw), added, len(all_keywords))
+                ap, sp, pb = await generate_keywords(session, brand, max_per_brand, status, kw_sem)
+                all_anti.extend(ap)
+                all_semi.extend(sp)
+                all_public.extend(pb)
+                logger.info("MULTI-KW: brand='%s' anti=%d semi=%d pub=%d", brand, len(ap), len(sp), len(pb))
 
-        kw_list = list(all_keywords)
-        random.shuffle(kw_list)
-
-        out = io.BytesIO("\n".join(kw_list).encode())
-        out.name = f"bulk_keywords_{len(brands)}brands_{len(kw_list)}.txt"
+        all_anti = list(dict.fromkeys(all_anti))
+        all_semi = list(dict.fromkeys(all_semi))
+        all_public = list(dict.fromkeys(all_public))
 
         ud = get_user(uid_s)
         ud["uses"] = ud.get("uses", 0) + 1
         db[uid_s] = ud; save_db(db)
 
-        top_brands = sorted(per_brand_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        breakdown = "\n".join([f"   `{esc(b)}`: {c}" for b, c in top_brands])
-        if len(brands) > 5:
-            breakdown += f"\n   _\\.\\.\\. and {len(brands) - 5} more_"
+        total = len(all_anti) + len(all_semi) + len(all_public)
+        ap_pct = int(100 * len(all_anti) / total) if total else 0
 
         await status.edit_text(
             f"✅ *Multi\\-Keyword — Done\\!*\n{DIV}\n\n"
-            f"   Brands processed: `{len(brands)}`\n"
-            f"   Total keywords: `{len(kw_list)}`\n"
-            f"   Per brand target: `{max_per_brand}`\n\n"
-            f"📊 *Breakdown:*\n{breakdown}\n\n"
-            f"{pbar(1, 1)}\n\n📄 File below ⬇️",
+            f"   Brands: `{len(brands)}`\n"
+            f"   Total: `{total}`\n\n"
+            f"   🟢 Anti\\-Public: `{len(all_anti)}` \\({ap_pct}%\\)\n"
+            f"   🟡 Semi\\-Public: `{len(all_semi)}`\n"
+            f"   🔴 Public: `{len(all_public)}`\n\n"
+            f"{pbar(1, 1)}\n\n📄 Files below ⬇️",
             parse_mode=ParseMode.MARKDOWN_V2)
 
-        await update.message.reply_document(
-            document=out,
-            caption=f"📦 {len(kw_list)} UHQ keywords from {len(brands)} brands")
+        if all_anti:
+            f_ap = io.BytesIO("\n".join(all_anti).encode())
+            f_ap.name = f"anti_public_bulk_{len(all_anti)}.txt"
+            await update.message.reply_document(document=f_ap,
+                caption=f"🟢 {len(all_anti)} Anti-Public keywords from {len(brands)} brands")
+
+        if all_semi:
+            f_sp = io.BytesIO("\n".join(all_semi).encode())
+            f_sp.name = f"semi_public_bulk_{len(all_semi)}.txt"
+            await update.message.reply_document(document=f_sp,
+                caption=f"🟡 {len(all_semi)} Semi-Public keywords")
+
+        if all_public:
+            f_pb = io.BytesIO("\n".join(all_public).encode())
+            f_pb.name = f"public_bulk_{len(all_public)}.txt"
+            await update.message.reply_document(document=f_pb,
+                caption=f"🔴 {len(all_public)} Public keywords")
+
+        all_kw = all_anti + all_semi + all_public
+        if all_kw:
+            f_all = io.BytesIO("\n".join(all_kw).encode())
+            f_all.name = f"all_keywords_bulk_{len(all_kw)}.txt"
+            await update.message.reply_document(document=f_all,
+                caption=f"📦 {len(all_kw)} total keywords from {len(brands)} brands")
         return
 
     # ── ANTI-PUBLIC CHECKER (Google-based, real result counts) ──
