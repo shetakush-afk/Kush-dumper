@@ -25,14 +25,15 @@ from telegram.ext import (
 
 # --- CONFIG ---
 TELEGRAM_TOKEN = "7545064228:AAHYqBGcXGJpK1WUp68-uuLZjMjTiPEPb2o"
-OXY_USER = "Pika1_MhRPr"
-OXY_PASS = "Pika=1234pika"
+OXY_ACCOUNTS = [
+    ("Pika1_MhRPr", "Pika=1234pika"),
+    ("Pookie_rifmR", "Pookie_12345"),
+]
+OXY_IDX = 0
 OWNER_IDS = {7214730073, 8003049490}
 DB_FILE = "users_db.json"
 PARSER_THREADS = 5
 GLOBAL_MAX_CONCURRENT = 10
-AI_BATCH_SIZE = 200
-AI_MAX_CALLS = 5
 AI_ENABLED = True
 
 logging.basicConfig(
@@ -173,146 +174,242 @@ def extract_brand(site_input):
     return site_input
 
 # ──────────────────────────────────────────────
-#  KEYWORD MAKER — Google Suggest via Oxylabs
+#  OXYLABS ROUND-ROBIN
 # ──────────────────────────────────────────────
 
-KW_SUFFIXES = [
-    "login", "account", "password", "email", "database", "users",
-    "combo", "premium", "free", "cracked", "config", "checker",
-    "generator", "hack", "dump", "leak", "breach", "exploit",
-    "admin", "panel", "dashboard", "api", "key", "token",
-    "signup", "register", "reset", "forgot", "recovery",
-    "subscription", "membership", "plan", "trial", "coupon",
-    "gift card", "code", "voucher", "discount", "promo",
-    "order", "payment", "billing", "invoice", "receipt",
-    "customer", "support", "contact", "help", "faq",
-    "download", "upload", "file", "backup", "export",
-    "settings", "profile", "edit", "update", "delete",
-    "search", "filter", "sort", "list", "view",
-    "cart", "checkout", "shop", "store", "buy",
-    "mobile", "app", "desktop", "web", "online",
-    "error", "bug", "fix", "issue", "problem",
-    "sql", "injection", "vulnerability", "security", "bypass",
-    "proxy", "vpn", "ssh", "ftp", "smtp",
-]
+def get_oxy_auth():
+    global OXY_IDX
+    user, passwd = OXY_ACCOUNTS[OXY_IDX % len(OXY_ACCOUNTS)]
+    OXY_IDX += 1
+    return aiohttp.BasicAuth(user, passwd)
 
-KW_PREFIXES = [
-    "free", "buy", "get", "how to", "best",
-    "cheap", "crack", "hack", "dump",
+OXY_API = "https://realtime.oxylabs.io/v1/queries"
+
+STOP_WORDS = {
+    "the", "and", "for", "with", "from", "how", "what", "this", "that", "are",
+    "was", "has", "have", "not", "but", "can", "all", "its", "you", "your",
+    "will", "been", "would", "could", "should", "also", "more", "about", "than",
+    "into", "over", "just", "like", "when", "where", "which", "their", "there",
+    "then", "these", "those", "them", "they", "some", "very", "only", "most",
+    "such", "each", "other", "between", "after", "before", "during", "while",
+    "both", "same", "own", "our", "out", "off", "any", "few", "many", "much",
+    "may", "might", "here", "who", "whom", "why", "does", "did", "had", "his",
+    "her", "him", "she", "per", "via", "etc", "use", "used", "using", "new",
+    "one", "two", "get", "got", "see", "now", "way", "let", "say", "top",
+}
+
+# ──────────────────────────────────────────────
+#  KEYWORD MAKER — Google Deep Scrape + Web Crawl
+# ──────────────────────────────────────────────
+
+SEARCH_DORKS = [
+    "{brand}", "{brand} login", "{brand} account", "{brand} password",
+    "{brand} admin panel", "{brand} database", "{brand} config",
+    "{brand} api", "{brand} dashboard", "{brand} leak",
+    "{brand} exploit", "{brand} vulnerability", "{brand} dump",
+    "{brand} premium", "{brand} free", "{brand} hack",
+    "{brand} settings", "{brand} security", "{brand} backup",
+    "{brand} error", "{brand} users", "{brand} email",
+    "site:{brand}.com", "inurl:{brand}", "intitle:{brand}",
 ]
 
 ALPHA = "abcdefghijklmnopqrstuvwxyz"
 
-async def fetch_google_suggest(session, query):
-    url = "https://realtime.oxylabs.io/v1/queries"
-    payload = {
-        "source": "google_search",
-        "query": query,
-        "user_agent_type": "desktop_chrome",
-        "parse": True,
-        "start_page": 1,
-        "pages": 1,
-        "limit": 10,
-    }
-    try:
-        async with session.post(
-            url, auth=aiohttp.BasicAuth(OXY_USER, OXY_PASS),
-            json=payload, timeout=aiohttp.ClientTimeout(total=30),
-        ) as r:
-            if r.status != 200:
-                return []
-            data = await r.json()
-            keywords = set()
-            for page in data.get("results", []):
-                content = page.get("content", {})
-                results = content.get("results", {})
-                organic = results.get("organic", [])
-                for item in organic:
-                    title = item.get("title", "")
-                    if title:
-                        keywords.add(title.lower().strip())
-                    desc = item.get("desc", "")
-                    if desc:
-                        words = re.findall(r'[a-zA-Z0-9]+(?:\s+[a-zA-Z0-9]+){0,3}', desc.lower())
-                        for w in words[:5]:
-                            keywords.add(w.strip())
-                related = results.get("related_searches", {})
-                if isinstance(related, dict):
-                    for item in related.get("related_searches", []):
-                        q = item.get("query", "")
-                        if q:
-                            keywords.add(q.lower().strip())
-                elif isinstance(related, list):
-                    for item in related:
-                        q = item.get("query", "") if isinstance(item, dict) else str(item)
-                        if q:
-                            keywords.add(q.lower().strip())
-                paa = results.get("people_also_ask", [])
-                if isinstance(paa, list):
-                    for item in paa:
-                        q = item.get("question", "") if isinstance(item, dict) else str(item)
-                        if q:
-                            keywords.add(q.lower().strip())
-            return list(keywords)
-    except Exception as e:
-        logger.error("Suggest err: %s", e)
-        return []
-
-async def fetch_suggest_throttled(session, query, sem):
+async def google_search_urls(session, query, sem):
+    """Search Google via Oxylabs → return URLs + keyword data from results."""
     async with sem:
         async with global_queue.slot():
-            return await fetch_google_suggest(session, query)
+            payload = {
+                "source": "google_search",
+                "query": query,
+                "user_agent_type": "desktop_chrome",
+                "parse": True,
+                "start_page": 1,
+                "pages": 3,
+                "limit": 30,
+            }
+            try:
+                async with session.post(
+                    OXY_API, auth=get_oxy_auth(),
+                    json=payload, timeout=aiohttp.ClientTimeout(total=40),
+                ) as r:
+                    if r.status != 200:
+                        return [], set()
+                    data = await r.json()
+                    urls = []
+                    keywords = set()
+                    for page in data.get("results", []):
+                        content = page.get("content", {})
+                        res = content.get("results", {})
+                        for item in res.get("organic", []):
+                            u = item.get("url")
+                            if u:
+                                urls.append(u)
+                            t = item.get("title", "")
+                            if t:
+                                keywords.add(t.lower().strip())
+                            d = item.get("desc", "")
+                            if d:
+                                for phrase in re.findall(r'[a-zA-Z0-9]+(?:[\s\-][a-zA-Z0-9]+){1,5}', d.lower()):
+                                    keywords.add(phrase.strip())
+                        related = res.get("related_searches", {})
+                        if isinstance(related, dict):
+                            for item in related.get("related_searches", []):
+                                q = item.get("query", "")
+                                if q:
+                                    keywords.add(q.lower().strip())
+                        elif isinstance(related, list):
+                            for item in related:
+                                q = item.get("query", "") if isinstance(item, dict) else str(item)
+                                if q:
+                                    keywords.add(q.lower().strip())
+                        paa = res.get("people_also_ask", [])
+                        if isinstance(paa, list):
+                            for item in paa:
+                                q = item.get("question", "") if isinstance(item, dict) else str(item)
+                                if q:
+                                    keywords.add(q.lower().strip())
+                    return urls, keywords
+            except Exception as e:
+                logger.error("GoogleSearch err: %s", e)
+                return [], set()
 
-# ──────────────────────────────────────────────
-#  AI KEYWORD EXPANSION (g4f — free, no key needed)
-# ──────────────────────────────────────────────
+async def crawl_page_keywords(session, url, sem):
+    """Crawl a URL via Oxylabs universal → extract keywords from HTML content."""
+    async with sem:
+        async with global_queue.slot():
+            payload = {
+                "source": "universal",
+                "url": url,
+                "user_agent_type": "desktop_chrome",
+            }
+            try:
+                async with session.post(
+                    OXY_API, auth=get_oxy_auth(),
+                    json=payload, timeout=aiohttp.ClientTimeout(total=25),
+                ) as r:
+                    if r.status != 200:
+                        return set()
+                    data = await r.json()
+                    keywords = set()
+                    for page in data.get("results", []):
+                        html = page.get("content", "")
+                        if not html or not isinstance(html, str):
+                            continue
+                        for tag in ["title", "h1", "h2", "h3"]:
+                            for m in re.findall(rf'<{tag}[^>]*>(.*?)</{tag}>', html, re.IGNORECASE | re.DOTALL):
+                                clean = re.sub(r'<[^>]+>', '', m).strip().lower()
+                                if clean and len(clean) > 3 and len(clean) < 200:
+                                    keywords.add(clean)
+                        for m in re.findall(r'<meta[^>]*name=["\'](?:keywords|description)["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE):
+                            for kw in re.split(r'[,;|]', m.lower()):
+                                kw = kw.strip()
+                                if kw and len(kw) > 3 and len(kw) < 200:
+                                    keywords.add(kw)
+                        text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+                        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+                        text = re.sub(r'<[^>]+>', ' ', text)
+                        text = re.sub(r'\s+', ' ', text).lower()
+                        for phrase in re.findall(r'[a-z0-9]+(?:[\s\-][a-z0-9]+){1,4}', text):
+                            phrase = phrase.strip()
+                            if len(phrase) > 5 and len(phrase) < 150:
+                                words = phrase.split()
+                                if not all(w in STOP_WORDS for w in words):
+                                    keywords.add(phrase)
+                    return keywords
+            except Exception as e:
+                logger.debug("Crawl err %s: %s", url[:60], e)
+                return set()
 
-AI_PROMPTS = [
-    (
-        "You are a keyword research expert. Given the brand/site '{brand}', generate {count} unique, "
-        "diverse search keywords that people would use on Google related to this brand. "
-        "CRITICAL: Every single keyword MUST contain the word '{brand}'. "
-        "Include variations like: login pages, account access, data leaks, config files, "
-        "admin panels, subdomains, API endpoints, error pages, backup files, user databases, "
-        "password resets, alternative sites, tools, scripts, tutorials, and exploits. "
-        "Output ONLY the keywords, one per line. No numbering, no explanations, no extra text."
-    ),
-    (
-        "Generate {count} Google search keywords for '{brand}'. "
-        "CRITICAL: Every keyword MUST contain the word '{brand}'. "
-        "Focus on: exposed files (sql, env, log, bak, cfg), cloud storage leaks (s3, azure, gcs), "
-        "open directories, git repos, credential dumps, payment pages, checkout systems, "
-        "API keys, tokens, secrets, internal tools, staging servers, debug pages, phpinfo, "
-        "wp-admin, cPanel, webmail, database errors, and stack traces. "
-        "Output ONLY keywords, one per line. No numbering, no extra text."
-    ),
-    (
-        "You are an OSINT specialist. Generate {count} unique search queries for '{brand}'. "
-        "CRITICAL: Every query MUST contain the word '{brand}'. "
-        "Cover: employee info, org structure, tech stack, CDN, mail servers, DNS records, "
-        "SSL certificates, WHOIS data, social media profiles, job postings with tech details, "
-        "conference talks, GitHub repos, npm packages, Docker images, Kubernetes configs, "
-        "CI/CD pipelines, monitoring dashboards, status pages, and changelogs. "
-        "Output ONLY queries, one per line. No numbering, no extra text."
-    ),
-    (
-        "Generate {count} long-tail search keywords for '{brand}'. "
-        "CRITICAL: Every keyword MUST contain the word '{brand}'. "
-        "Include: year-specific queries (2024, 2025, 2026), region-specific variations, "
-        "competitor comparisons, 'how to' guides, troubleshooting queries, "
-        "review and rating searches, pricing queries, feature requests, "
-        "integration keywords, migration keywords, and security audit terms. "
-        "Output ONLY keywords, one per line. No numbering, no extra text."
-    ),
-    (
-        "Create {count} niche search dork keywords for '{brand}'. "
-        "CRITICAL: Every keyword MUST contain the word '{brand}'. "
-        "Include: filetype-specific (pdf, xlsx, doc, csv, xml, json), inurl patterns, "
-        "intitle patterns, cache/archive queries, site-specific (pastebin, github, "
-        "trello, jira, confluence, slack, discord), and deep web references. "
-        "Output ONLY raw keywords, one per line. No numbering, no extra text."
-    ),
-]
+async def generate_keywords(session, brand, max_count, status_msg, sem):
+    all_kw = set()
+    all_urls = set()
+    brand_lower = brand.lower()
+
+    # ── Step 1: Google search with multiple dorks ──
+    try:
+        await status_msg.edit_text(
+            f"🔤 *Keyword Maker — Step 1: Google Search*\n{DIV}\n\n"
+            f"   Brand: `{esc(brand)}`\n"
+            f"   Searching Google with multiple queries\\.\\.\\.\n\n"
+            f"{pbar(0, 3)}",
+            parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception:
+        pass
+
+    queries = [d.format(brand=brand) for d in SEARCH_DORKS]
+    for letter in ALPHA:
+        queries.append(f"{brand} {letter}")
+
+    tasks = [google_search_urls(session, q, sem) for q in queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in results:
+        if isinstance(r, tuple):
+            urls, kws = r
+            all_urls.update(urls)
+            for kw in kws:
+                if brand_lower in kw.lower() and len(kw) > 3:
+                    all_kw.add(kw)
+
+    logger.info("KW Step1: %d URLs found, %d keywords from Google for '%s'", len(all_urls), len(all_kw), brand)
+
+    # ── Step 2: Crawl URLs → extract keywords from pages ──
+    urls_to_crawl = list(all_urls)[:200]
+    if urls_to_crawl:
+        try:
+            await status_msg.edit_text(
+                f"🔤 *Keyword Maker — Step 2: Crawling URLs*\n{DIV}\n\n"
+                f"   Brand: `{esc(brand)}`\n"
+                f"   URLs found: `{len(all_urls)}`\n"
+                f"   Crawling: `{len(urls_to_crawl)}` pages\n"
+                f"   Keywords so far: `{len(all_kw)}`\n\n"
+                f"{pbar(1, 3)}",
+                parse_mode=ParseMode.MARKDOWN_V2)
+        except Exception:
+            pass
+
+        crawl_done = 0
+        batch_size = 10
+        for i in range(0, len(urls_to_crawl), batch_size):
+            batch = urls_to_crawl[i:i+batch_size]
+            crawl_results = await asyncio.gather(
+                *[crawl_page_keywords(session, u, sem) for u in batch],
+                return_exceptions=True
+            )
+            for cr in crawl_results:
+                if isinstance(cr, set):
+                    for kw in cr:
+                        if brand_lower in kw.lower():
+                            all_kw.add(kw)
+            crawl_done += len(batch)
+            if crawl_done % 30 == 0:
+                try:
+                    await status_msg.edit_text(
+                        f"🔤 *Keyword Maker — Step 2: Crawling*\n{DIV}\n\n"
+                        f"   Crawled: `{crawl_done}/{len(urls_to_crawl)}`\n"
+                        f"   Keywords: `{len(all_kw)}`\n\n"
+                        f"{pbar(crawl_done, len(urls_to_crawl))}",
+                        parse_mode=ParseMode.MARKDOWN_V2)
+                except Exception:
+                    pass
+
+        logger.info("KW Step2: crawled %d pages, total %d keywords for '%s'", crawl_done, len(all_kw), brand)
+
+    # ── Step 3: Finalize ──
+    try:
+        await status_msg.edit_text(
+            f"🔤 *Keyword Maker — Step 3: Finalizing*\n{DIV}\n\n"
+            f"   Brand: `{esc(brand)}`\n"
+            f"   Total keywords: `{len(all_kw)}`\n\n"
+            f"{pbar(2, 3)}",
+            parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception:
+        pass
+
+    kw_list = list(all_kw)
+    random.shuffle(kw_list)
+    return kw_list[:max_count]
 
 g4f_client = G4FClient() if G4F_AVAILABLE else None
 
@@ -323,265 +420,17 @@ def _clean_ai_line(line):
     line = line.lower()
     return line
 
-async def ai_expand_keywords(brand, existing_kw, target_count):
-    if not AI_ENABLED or not g4f_client:
-        return set()
-
-    new_kw = set()
-    brand_lower = brand.lower()
-    needed = max(target_count - len(existing_kw), 200)
-    per_call = max(needed // AI_MAX_CALLS, AI_BATCH_SIZE)
-
-    for i in range(min(AI_MAX_CALLS, len(AI_PROMPTS))):
-        if len(existing_kw) + len(new_kw) >= target_count:
-            break
-
-        prompt = AI_PROMPTS[i].format(brand=brand, count=per_call)
-        sample = random.sample(list(existing_kw), min(15, len(existing_kw)))
-        prompt += "\n\nAvoid duplicating these existing keywords:\n" + "\n".join(sample)
-
-        try:
-            response = await g4f_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = response.choices[0].message.content or ""
-            count_before = len(new_kw)
-            rejected = 0
-            for line in text.splitlines():
-                cleaned = _clean_ai_line(line)
-                if not cleaned or len(cleaned) <= 2 or len(cleaned) >= 200 or cleaned.startswith("http"):
-                    continue
-                if brand_lower not in cleaned:
-                    rejected += 1
-                    continue
-                new_kw.add(cleaned)
-            added = len(new_kw) - count_before
-            logger.info("AI call %d: +%d keywords, %d rejected (no brand) for '%s'", i, added, rejected, brand)
-        except Exception as e:
-            logger.error("AI call %d error: %s", i, e)
-            continue
-
-    return new_kw
-
-SCRAPE_PROMPTS = [
-    (
-        "You are a keyword research expert. I have a list of existing keywords. "
-        "Analyze their patterns, themes, and structure, then generate {count} NEW unique keywords "
-        "that follow the same style and topics but are DIFFERENT from the input. "
-        "Create variations by: changing suffixes, adding years, adding action words, "
-        "combining themes, adding specificity (regions, versions, platforms), "
-        "and exploring related sub-topics. "
-        "Output ONLY new keywords, one per line. No numbering, no explanations.\n\n"
-        "Existing keywords:\n{keywords}"
-    ),
-    (
-        "Study these keywords and generate {count} MORE unique keywords in the same niche. "
-        "Focus on: long-tail variations, question-based queries, comparison queries, "
-        "how-to queries, error/troubleshooting queries, year-specific (2024-2026), "
-        "platform-specific (mobile, desktop, web), and action-oriented variations. "
-        "Every keyword should be related to the same topics/brands as the input. "
-        "Output ONLY keywords, one per line. No numbering.\n\n"
-        "Input keywords:\n{keywords}"
-    ),
-    (
-        "Analyze these keywords and generate {count} new related search queries. "
-        "Expand into: security/vulnerability angles, admin/config angles, "
-        "file-type specific queries, site-specific queries (github, pastebin, etc), "
-        "data leak angles, cloud storage angles, API/endpoint angles, "
-        "and technical deep-dive queries. Keep the same brand/topic focus. "
-        "Output ONLY queries, one per line. No numbering.\n\n"
-        "Source keywords:\n{keywords}"
-    ),
-]
-
-async def ai_scrape_expand(input_keywords, status_msg):
-    if not AI_ENABLED or not g4f_client:
-        return set()
-
-    new_kw = set()
-    input_set = set(k.lower().strip() for k in input_keywords)
-    total_input = len(input_set)
-
-    brands = _extract_common_words(list(input_set))
-    logger.info("SCRAPE: detected common words: %s", brands[:10])
-
-    batch_size = 80
-    kw_list = list(input_set)
-    random.shuffle(kw_list)
-
-    batches = [kw_list[i:i+batch_size] for i in range(0, len(kw_list), batch_size)]
-    max_batches = min(len(batches), 15)
-    per_batch_count = max(200, total_input // max_batches) if max_batches > 0 else 200
-
-    call_num = 0
-    for batch_idx in range(max_batches):
-        batch = batches[batch_idx]
-        prompt_idx = batch_idx % len(SCRAPE_PROMPTS)
-        prompt = SCRAPE_PROMPTS[prompt_idx].format(
-            count=per_batch_count,
-            keywords="\n".join(batch)
-        )
-
-        try:
-            response = await g4f_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = response.choices[0].message.content or ""
-            count_before = len(new_kw)
-            for line in text.splitlines():
-                cleaned = _clean_ai_line(line)
-                if not cleaned or len(cleaned) <= 2 or len(cleaned) >= 200 or cleaned.startswith("http"):
-                    continue
-                if cleaned not in input_set:
-                    if brands and any(b in cleaned for b in brands):
-                        new_kw.add(cleaned)
-                    elif not brands:
-                        new_kw.add(cleaned)
-            added = len(new_kw) - count_before
-            call_num += 1
-            logger.info("SCRAPE call %d: +%d keywords (total new: %d)", call_num, added, len(new_kw))
-
-            if call_num % 3 == 0 or call_num == max_batches:
-                try:
-                    await status_msg.edit_text(
-                        f"🧲 *Keyword Scraper — AI Processing*\n{DIV}\n\n"
-                        f"   Input keywords: `{total_input}`\n"
-                        f"   AI batches: `{call_num}/{max_batches}`\n"
-                        f"   New keywords: `{len(new_kw)}`\n\n"
-                        f"{pbar(call_num, max_batches)}\n\n"
-                        f"⏳ 🤖 Expanding\\.\\.\\.",
-                        parse_mode=ParseMode.MARKDOWN_V2)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error("SCRAPE call %d error: %s", call_num, e)
-            continue
-
-    return new_kw
-
 def _extract_common_words(keywords, min_freq=0.15):
     word_count = {}
     total = len(keywords)
     for kw in keywords:
         words = set(kw.lower().split())
         for w in words:
-            if len(w) > 2 and w not in {"the", "and", "for", "with", "from", "how", "what", "this", "that", "are", "was", "has", "have", "not", "but", "can", "all", "its", "you", "your"}:
+            if len(w) > 2 and w not in STOP_WORDS:
                 word_count[w] = word_count.get(w, 0) + 1
     threshold = max(total * min_freq, 3)
     common = [w for w, c in sorted(word_count.items(), key=lambda x: -x[1]) if c >= threshold]
     return common[:5]
-
-async def generate_keywords(session, brand, max_count, status_msg, sem):
-    all_kw = set()
-    all_kw.add(brand)
-    all_kw.add(f"{brand}.com")
-    all_kw.add(f"{brand} login")
-    all_kw.add(f"{brand} account")
-
-    for s in KW_SUFFIXES:
-        all_kw.add(f"{brand} {s}")
-    for p in KW_PREFIXES:
-        all_kw.add(f"{p} {brand}")
-    for letter in ALPHA:
-        all_kw.add(f"{brand} {letter}")
-
-    logger.info("KW: algorithmic generated %d base keywords for '%s'", len(all_kw), brand)
-
-    if len(all_kw) < max_count:
-        seed_queries = [brand]
-        for letter in ALPHA:
-            seed_queries.append(f"{brand} {letter}")
-        seed_queries = seed_queries[:27]
-
-        try:
-            await status_msg.edit_text(
-                f"🔤 *Keyword Maker — Scraping*\n{DIV}\n\n"
-                f"   Brand: `{esc(brand)}`\n"
-                f"   Base keywords: `{len(all_kw)}`\n"
-                f"   Scraping Google for more\\.\\.\\.\n\n"
-                f"{pbar(len(all_kw), max_count)}",
-                parse_mode=ParseMode.MARKDOWN_V2)
-        except Exception:
-            pass
-
-        tasks = [fetch_suggest_throttled(session, q, sem) for q in seed_queries]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        brand_lower = brand.lower()
-        scraped_rejected = 0
-        for r in results:
-            if isinstance(r, list):
-                for kw in r:
-                    kw_clean = kw.strip().lower()
-                    if not kw_clean or len(kw_clean) <= 2:
-                        continue
-                    if brand_lower not in kw_clean:
-                        scraped_rejected += 1
-                        continue
-                    all_kw.add(kw_clean)
-
-        logger.info("KW: after scraping got %d keywords (%d rejected, no brand) for '%s'", len(all_kw), scraped_rejected, brand)
-
-    # ── Layer 3: AI Expansion ──
-    if len(all_kw) < max_count and AI_ENABLED:
-        try:
-            await status_msg.edit_text(
-                f"🔤 *Keyword Maker — AI Expanding*\n{DIV}\n\n"
-                f"   Brand: `{esc(brand)}`\n"
-                f"   Current keywords: `{len(all_kw)}`\n"
-                f"   🤖 AI generating more\\.\\.\\.\n\n"
-                f"{pbar(len(all_kw), max_count)}",
-                parse_mode=ParseMode.MARKDOWN_V2)
-        except Exception:
-            pass
-
-        ai_kw = await ai_expand_keywords(brand, all_kw, max_count)
-        all_kw.update(ai_kw)
-        logger.info("KW: after AI expansion got %d keywords for '%s'", len(all_kw), brand)
-
-    try:
-        await status_msg.edit_text(
-            f"🔤 *Keyword Maker — Finalizing*\n{DIV}\n\n"
-            f"   Brand: `{esc(brand)}`\n"
-            f"   Total keywords: `{len(all_kw)}`\n"
-            f"   Expanding to `{max_count}`\\.\\.\\.\n\n"
-            f"{pbar(len(all_kw), max_count)}",
-            parse_mode=ParseMode.MARKDOWN_V2)
-    except Exception:
-        pass
-
-    if len(all_kw) < max_count:
-        extra_suffixes = [
-            "2024", "2025", "2026", "new", "latest", "working",
-            "fresh", "valid", "real", "legit", "official",
-            "site", "website", "page", "portal", "link",
-            "data", "info", "details", "list", "collection",
-            "tool", "software", "script", "bot", "automation",
-            "test", "demo", "sample", "example", "tutorial",
-            "method", "trick", "tip", "guide", "manual",
-            "alternative", "similar", "like", "clone", "copy",
-            "pro", "plus", "ultra", "max", "lite",
-            "mod", "patch", "crack", "serial", "keygen",
-            "private", "public", "shared", "open", "closed",
-            "basic", "standard", "enterprise", "business", "personal",
-        ]
-        for s in extra_suffixes:
-            all_kw.add(f"{brand} {s}")
-            if len(all_kw) >= max_count * 2:
-                break
-        for s1 in KW_SUFFIXES[:20]:
-            for s2 in extra_suffixes[:10]:
-                all_kw.add(f"{brand} {s1} {s2}")
-                if len(all_kw) >= max_count * 2:
-                    break
-            if len(all_kw) >= max_count * 2:
-                break
-
-    kw_list = list(all_kw)
-    random.shuffle(kw_list)
-    return kw_list[:max_count]
 
 # ──────────────────────────────────────────────
 #  PRESET TEMPLATES
@@ -907,7 +756,6 @@ async def fetch_oxylabs(session, query, sem=None):
     user_sem = sem or asyncio.Semaphore(PARSER_THREADS)
     async with user_sem:
         async with global_queue.slot():
-            url = "https://realtime.oxylabs.io/v1/queries"
             payload = {
                 "source": "google_search", "query": query,
                 "user_agent_type": "desktop_chrome", "parse": True,
@@ -916,7 +764,7 @@ async def fetch_oxylabs(session, query, sem=None):
             logger.info("PARSER [thread] query: %.100s", query)
             try:
                 async with session.post(
-                    url, auth=aiohttp.BasicAuth(OXY_USER, OXY_PASS),
+                    OXY_API, auth=get_oxy_auth(),
                     json=payload, timeout=aiohttp.ClientTimeout(total=90),
                 ) as r:
                     body_text = await r.text()
@@ -1061,7 +909,7 @@ WELCOME = (
     f"{DIV}\n\n"
     "Welcome\\! Pick a module to get started\\.\n\n"
     "📌 *Full Pipeline:*\n"
-    "  1️⃣  🔤 Keyword Maker \\→ AI\\-powered keywords\n"
+    "  1️⃣  🔤 Keyword Maker \\→ deep scrape keywords\n"
     "  2️⃣  🛠 Dork Generator \\→ build dorks\n"
     "  3️⃣  🔎 Deep Parser \\→ get real URLs\n\n"
     "🔑 *License required for all features*\n\n"
@@ -1072,17 +920,17 @@ HELP = (
     "❓ *How to Use This Bot*\n"
     f"{DIV}\n\n"
     "🔤 *Keyword Maker*  \\(License Required\\)\n"
-    "  Single Site, Multi\\-Keyword, Keyword Scraper\n"
-    "  🤖 *AI\\-Powered* \\+ Google scraping\\.\n"
-    "  Generates massive UHQ keyword lists\\.\n\n"
+    "  Google Deep Scrape \\+ Web Crawling\\.\n"
+    "  Scrapes Google → crawls URLs → extracts keywords\\.\n"
+    "  Single Site or Multi\\-Keyword bulk mode\\.\n\n"
+    "🔍 *Anti\\-Public Checker*  \\(License Required\\)\n"
+    "  AI checks keyword rarity\\.\n"
+    "  Separates rare vs overused keywords\\.\n\n"
     "🛠 *Dork Generator*  \\(License Required\\)\n"
     "  3 presets \\(Combo, Shopping, CC SQLi\\)\n"
     "  \\+ Custom Builder with full control\\.\n\n"
     "🔎 *Deep Parser*  \\(License Required\\)\n"
-    "  Scrapes Google with 5 threads\\.\n\n"
-    "🔍 *Anti\\-Public Checker*  \\(License Required\\)\n"
-    "  Checks keywords against Google\\.\n"
-    "  Separates rare vs overused keywords\\.\n\n"
+    "  Scrapes Google for real URLs\\.\n\n"
     f"{DIV}\n"
     "🔑 *License System:*\n"
     "  Purchase a license key from the owner\\.\n"
@@ -1227,16 +1075,6 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"User `{tid}` not found\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
-async def cmd_toggleai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AI_ENABLED
-    if update.effective_user.id not in OWNER_IDS: return
-    AI_ENABLED = not AI_ENABLED
-    status = "ON 🟢" if AI_ENABLED else "OFF 🔴"
-    await update.message.reply_text(
-        f"🤖 *AI Keyword Expansion: {status}*\n{DIV}\n\n"
-        f"AI is now *{'enabled' if AI_ENABLED else 'disabled'}* for keyword generation\\.",
-        parse_mode=ParseMode.MARKDOWN_V2)
-
 
 # ──────────────────────────────────────────────
 #  BUTTON HANDLER
@@ -1296,21 +1134,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔤  Single Site", callback_data='kw_single')],
             [InlineKeyboardButton("📦  Multi-Keyword (Bulk)", callback_data='kw_multi')],
-            [InlineKeyboardButton("🧲  Keyword Scraper", callback_data='kw_scrape')],
             [InlineKeyboardButton("🔍  Anti-Public Checker", callback_data='kw_antipub')],
             [InlineKeyboardButton("⬅️  Back to Menu", callback_data='back_menu')],
         ])
         text = (
             f"🔤 *Keyword Maker*\n{DIV}\n\n"
-            f"🤖 *AI\\-Powered* \\+ Google scraping \\+ algorithmic\\.\n"
+            f"🌐 *Google Deep Scrape* \\+ Web Crawling\\.\n"
             f"🟢 License: `{esc(remaining or '')}`\n\n"
             f"Choose a mode:\n\n"
             f"🔤 *Single Site*\n"
-            f"   _Enter one brand/site, generate keywords_\n\n"
+            f"   _Enter one brand → scrape Google \\+ crawl pages_\n\n"
             f"📦 *Multi\\-Keyword \\(Bulk\\)*\n"
             f"   _Enter multiple brands at once, merge results_\n\n"
-            f"🧲 *Keyword Scraper*\n"
-            f"   _Feed existing keywords, AI expands them 10x_\n\n"
             f"🔍 *Anti\\-Public Checker*\n"
             f"   _Check keywords rarity, keep only UHQ ones_"
         )
@@ -1340,24 +1175,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"_Total output \\= count × number of brands_"
         )
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2)
-        return
-
-    if data == 'kw_scrape':
-        user_states[uid] = {"mode": "KEYWORD", "step": "scrape_input", "kw_type": "scrape"}
-        bk = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️  Back", callback_data='mode_kw')],
-        ])
-        text = (
-            f"🧲 *Keyword Scraper*\n{DIV}\n\n"
-            f"Feed me your *existing keywords* and AI will\n"
-            f"expand them into *10x more* related keywords\\.\n\n"
-            f"📝 *How to send:*\n"
-            f"• Paste keywords below \\(one per line\\)\n"
-            f"• Or upload a `.txt` file\n\n"
-            f"💡 _Works best with 50\\-5000 input keywords_\n"
-            f"_AI analyzes patterns \\& generates variations_"
-        )
-        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=bk)
         return
 
     if data == 'kw_antipub':
@@ -1846,57 +1663,6 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             caption=f"📦 {len(kw_list)} UHQ keywords from {len(brands)} brands")
         return
 
-    # ── KEYWORD SCRAPER — expand existing keywords via AI ──
-    if mode == "KEYWORD" and step == "scrape_input":
-        input_keywords = [l.strip().lower() for l in lines if l.strip() and len(l.strip()) > 2]
-        input_keywords = list(dict.fromkeys(input_keywords))
-
-        if len(input_keywords) < 5:
-            await update.message.reply_text(
-                "⚠️ *Too few keywords\\!*\n\nSend at least 5 keywords for the scraper to work\\.",
-                parse_mode=ParseMode.MARKDOWN_V2)
-            return
-
-        brands_detected = _extract_common_words(input_keywords)
-        brands_display = ", ".join(brands_detected[:3]) if brands_detected else "auto\\-detect"
-
-        status = await update.message.reply_text(
-            f"🧲 *Keyword Scraper — Starting*\n{DIV}\n\n"
-            f"   Input keywords: `{len(input_keywords)}`\n"
-            f"   Detected themes: `{esc(brands_display)}`\n\n"
-            f"{pbar(0, 1)}\n\n"
-            f"⏳ 🤖 AI analyzing patterns \\& expanding\\.\\.\\.",
-            parse_mode=ParseMode.MARKDOWN_V2)
-
-        new_kw = await ai_scrape_expand(input_keywords, status)
-
-        all_kw = set(input_keywords) | new_kw
-        kw_list = list(all_kw)
-        random.shuffle(kw_list)
-
-        out = io.BytesIO("\n".join(kw_list).encode())
-        out.name = f"scraped_keywords_{len(kw_list)}.txt"
-
-        ud = get_user(uid_s)
-        ud["uses"] = ud.get("uses", 0) + 1
-        db[uid_s] = ud; save_db(db)
-
-        multiplier = f"{len(kw_list) / len(input_keywords):.1f}x" if input_keywords else "N/A"
-
-        await status.edit_text(
-            f"✅ *Keyword Scraper — Done\\!*\n{DIV}\n\n"
-            f"   Input: `{len(input_keywords)}` keywords\n"
-            f"   AI generated: `{len(new_kw)}` new\n"
-            f"   Total output: `{len(kw_list)}`\n"
-            f"   Expansion: *{esc(multiplier)}*\n\n"
-            f"{pbar(1, 1)}\n\n📄 File below ⬇️",
-            parse_mode=ParseMode.MARKDOWN_V2)
-
-        await update.message.reply_document(
-            document=out,
-            caption=f"🧲 {len(kw_list)} keywords ({len(input_keywords)} input → {len(new_kw)} new)")
-        return
-
     # ── ANTI-PUBLIC CHECKER (AI-only, fast, no keywords skipped) ──
     if mode == "KEYWORD" and step == "antipub_input":
         input_keywords = [l.strip() for l in lines if l.strip() and len(l.strip()) > 2]
@@ -2094,8 +1860,9 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
         ud["uses"] = ud.get("uses", 0) + 1
         db[uid_s] = ud; save_db(db)
 
+        raw_count = len(results)
         final = list(set(results))
-        logger.info("PARSER done: user=%s raw=%d unique=%d", uid_s, len(results), len(final))
+        logger.info("PARSER done: user=%s raw=%d unique=%d", uid_s, raw_count, len(final))
         err_note = f"\n   ⚠️ Errors: `{errors}`\n" if errors else ""
 
         if not final:
@@ -2108,9 +1875,11 @@ async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, line
             f_out.name = f"parsed_urls_{datetime.now().strftime('%H%M%S')}.txt"
             await status.edit_text(
                 f"{icon} *{esc(label)} — Complete*\n{DIV}\n\n"
-                f"   Scanned: `{len(lines)}` {item_w}\n   Results: `{len(final)}`{err_note}\n\n"
-                f"{pbar(1, 1)}\n\n📄 File below ⬇️", parse_mode=ParseMode.MARKDOWN_V2)
-            await update.message.reply_document(document=f_out, caption=f"{icon} {len(final)} results")
+                f"   Scanned: `{len(lines)}` {item_w}\n"
+                f"   Raw URLs: `{raw_count}`\n"
+                f"   Unique URLs: `{len(final)}`{err_note}\n\n"
+                f"{pbar(1, 1)}\n\n📄 File contains all `{len(final)}` unique URLs ⬇️", parse_mode=ParseMode.MARKDOWN_V2)
+            await update.message.reply_document(document=f_out, caption=f"{icon} {len(final)} unique URLs (from {raw_count} raw)")
         return
 
     await update.message.reply_text(
@@ -2167,7 +1936,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("key", cmd_key))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
-    app.add_handler(CommandHandler("toggleai", cmd_toggleai))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), file_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
